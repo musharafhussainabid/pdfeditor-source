@@ -365,6 +365,9 @@ async function call(path, form) {
     try { msg = (await res.json()).error.message; } catch {}
     if (res.status === 413) throw new Error(`This file is too large. ${msg}`);
     if (res.status === 422 && msg) throw new Error(msg);
+    if (res.status === 429) throw new Error("Too many requests in a short time. Please wait a moment and try again.");
+    if (res.status === 502 || res.status === 503 || res.status === 504)
+      throw new Error("This is taking longer than usual. Please try again in a moment.");
     throw new Error(path === "/edit" ? "We couldn't apply your changes. Please try again."
                                      : "We couldn't open this file. Please try another PDF.");
   }

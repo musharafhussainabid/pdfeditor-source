@@ -8,6 +8,7 @@ page content (PyMuPDF). Pure functions: bytes in, bytes out. No web server, no d
 `info` is the engine's private analysis (store it with the session); `layout` is
 the public JSON the apps use to draw edit boxes and list controls.
 """
+import bisect
 import json
 import os
 import re
@@ -831,8 +832,10 @@ def detect_lists(page, lines):
     def base(i):
         return L[i]["origin"][1]
 
+    boxes = [fitz.Rect(l["tbox"]) for l in L]   # built once: box() is called very often
+
     def box(i):
-        return fitz.Rect(L[i]["tbox"])
+        return boxes[i]
 
     markers = {}
     lone = [i for i, l in enumerate(L) if l.get("_marker", {}).get("lone")]
@@ -866,24 +869,33 @@ def detect_lists(page, lines):
     drawings = page.get_drawings()
     area = page.rect.get_area()
     images = [fitz.Rect(x["bbox"]) for x in page.get_image_info()]
+    # Only bullet-sized drawings can be (part of) a bullet. Pages with tables can have thousands
+    # of drawings, so keep the small ones once, as plain numbers: (x0, y0, x1, y1, w, h, drawing).
+    max_sz = max((l["size"] for l in L if l["editable"]), default=0)
+    small = []
+    for d in drawings:
+        r = d["rect"]
+        w, h = max(r.x1 - r.x0, 0), max(r.y1 - r.y0, 0)   # as Rect.width / height
+        if w <= 0.9 * max_sz and h <= 0.9 * max_sz:
+            small.append((r.x0, r.y0, r.x1, r.y1, w, h, d))
     for i, l in enumerate(L):
         if i in markers or not l["editable"] or l.get("_marker"):
             continue
-        sz, bb = l["size"], box(i)
+        sz, bb, lx = l["size"], box(i), l["x"]
         best = None
-        for d in drawings:
-            r = d["rect"]
-            if not (0.8 <= r.width <= 0.9 * sz and 0.8 <= r.height <= 0.9 * sz):
+        for x0, y0, x1, y1, w, h, d in small:
+            if not (0.8 <= w <= 0.9 * sz and 0.8 <= h <= 0.9 * sz):
                 continue
-            cy = (r.y0 + r.y1) / 2
-            if bb.y0 <= cy <= bb.y1 and r.x1 <= l["x"] + 0.5 and l["x"] - r.x1 <= 3 * sz:
-                if best is None or l["x"] - r.x1 < best[0]:
-                    best = (l["x"] - r.x1, r)
+            cy = (y0 + y1) / 2
+            if bb.y0 <= cy <= bb.y1 and x1 <= lx + 0.5 and lx - x1 <= 3 * sz:
+                if best is None or lx - x1 < best[0]:
+                    best = (lx - x1, d["rect"])
         if best:
             r0 = best[1]
-            parts = [d for d in drawings
-                     if d["rect"].intersects(r0 + (-0.5, -0.5, 0.5, 0.5)) and d["rect"].width <= 0.9 * sz
-                     and d["rect"].height <= 0.9 * sz and not is_background(d, area)]
+            g = (r0.x0 - 0.5, r0.y0 - 0.5, r0.x1 + 0.5, r0.y1 + 0.5)
+            parts = [d for x0, y0, x1, y1, w, h, d in small
+                     if w > 0 and h > 0 and x0 < g[2] and g[0] < x1 and y0 < g[3] and g[1] < y1   # = Rect.intersects
+                     and w <= 0.9 * sz and h <= 0.9 * sz and not is_background(d, area)]
             u = fitz.Rect(r0)
             for d in parts:
                 u |= d["rect"]
@@ -1213,13 +1225,27 @@ def column_rights(page, lines):
     """
     area = page.rect.get_area()
     vedges, spans = [], []  # vertical edges (x, y0, y1); horizontal extents (x0, x1, y0, y1)
-    tboxes = [fitz.Rect(l["tbox"]) for l in lines]
+    # Text boxes sorted by top edge, as plain tuples: a page can have thousands of drawings and
+    # hundreds of lines, so each drawing is only compared with the lines at its height.
+    tboxes = sorted((tuple(l["tbox"]) for l in lines), key=lambda t: t[1])
+    tops = [t[1] for t in tboxes]
+    tallest = max((t[3] - t[1] for t in tboxes), default=0)
+
+    def sits_on_text(r):
+        need = 0.5 * max(r.width * r.height, 1e-6)
+        for k in range(bisect.bisect_left(tops, r.y0 - tallest), bisect.bisect_right(tops, r.y1)):
+            x0, y0, x1, y1 = tboxes[k]
+            w, h = min(r.x1, x1) - max(r.x0, x0), min(r.y1, y1) - max(r.y0, y0)
+            if w > 0 and h > 0 and w * h > need:
+                return True
+        return False
+
     for d in page.get_drawings():
         if is_background(d, area):
             continue
         r = ink_rect(d)
         # boxes that mostly sit on text are highlights/inline backgrounds, not cells
-        if r.height < 30 and any((r & t).get_area() > 0.5 * max(r.get_area(), 1e-6) for t in tboxes):
+        if r.height < 30 and sits_on_text(r):
             continue
         if r.width < 3 and r.height > 3:
             vedges.append((r.x0 + r.width / 2, r.y0, r.y1))
@@ -1244,10 +1270,40 @@ def column_rights(page, lines):
     line_alignment(lines)
 
 
+class _YIndex:
+    """Finds the items whose vertical range [y0, y1] may touch a band, without scanning them all.
+    Only a pre-filter: callers still apply their exact test, in the original item order."""
+
+    def __init__(self, ranges, lo, hi, step=16.0):
+        self.step, self.lo, self.hi, self.bins = step, int(lo // step), int(hi // step), {}
+        for k, (y0, y1) in enumerate(ranges):
+            if not (y0 <= y1):                       # NaN or inverted: keep it findable everywhere
+                y0, y1 = lo, hi
+            y0, y1 = min(max(y0, lo), hi), max(min(y1, hi), lo)   # clamp (also handles infinities)
+            for b in range(int(y0 // step), int(y1 // step) + 1):
+                self.bins.setdefault(b, []).append(k)
+
+    def near(self, a, b):
+        found = set()
+        for k in range(max(int(a // self.step), self.lo), min(int(b // self.step), self.hi) + 1):
+            found.update(self.bins.get(k, ()))
+        return sorted(found)
+
+
 def _bounds(lines, extent, vedges, spans, body_left, body_right):
 
     def vov(o, tb, sz):
         return min(o["tbox"][3], tb[3]) - max(o["tbox"][1], tb[1]) > 0.3 * sz
+
+    # Tables can mean thousands of edges and hundreds of lines: index them by height on the page.
+    if not lines:
+        return
+    big = max(l["size"] for l in lines)
+    lo = min(l["tbox"][1] for l in lines) - 4 * big - 1
+    hi = max(l["tbox"][3] for l in lines) + 4 * big + 1
+    v_idx = _YIndex([(y0, y1) for _, y0, y1 in vedges], lo, hi)
+    s_idx = _YIndex([(s[2], s[3]) for s in spans], lo, hi)
+    l_idx = _YIndex([(o["tbox"][1], o["tbox"][3]) for o in lines], lo, hi)
 
     for i, l in enumerate(lines):
         if i not in extent:
@@ -1258,15 +1314,16 @@ def _bounds(lines, extent, vedges, spans, body_left, body_right):
         lx0, lx1 = l["x"], l["bbox"][2]
         cy, sz = (tb[1] + tb[3]) / 2, l["size"]
         rc, lc = [], []
-        right_v = [x for x, y0, y1 in vedges if y0 <= cy <= y1 and x >= lx1 - 0.5]
-        left_v = [x for x, y0, y1 in vedges if y0 <= cy <= y1 and x <= lx0 + 0.5]
+        here_v = [vedges[k] for k in v_idx.near(cy, cy)]
+        right_v = [x for x, y0, y1 in here_v if y0 <= cy <= y1 and x >= lx1 - 0.5]
+        left_v = [x for x, y0, y1 in here_v if y0 <= cy <= y1 and x <= lx0 + 0.5]
         gap = lx0 - max(left_v) if left_v else None
         vpad = gap if gap is not None and gap <= 3 * sz else 4.0
         if right_v:
             rc.append(min(right_v) - vpad)
         if left_v:
             lc.append(max(left_v) + vpad)
-        others = [o for j, o in enumerate(lines) if j not in para and vov(o, tb, sz)]
+        others = [lines[j] for j in l_idx.near(tb[1], tb[3]) if j not in para and vov(lines[j], tb, sz)]
         beside_r = [o["tbox"][0] for o in others if o["tbox"][0] >= lx1 - 0.5]
         beside_l = [o["tbox"][2] for o in others if o["tbox"][2] <= lx0 + 0.5]
         gutter = max(8.0, 0.8 * sz)
@@ -1275,7 +1332,8 @@ def _bounds(lines, extent, vedges, spans, body_left, body_right):
         if beside_l:
             lc.append(max(beside_l) + gutter)
         # rules / cell borders / boxes spanning the whole paragraph bound its column
-        near = [s for s in spans if s[0] <= px0 + 0.5 and s[1] >= px1 - 0.5
+        near = [s for s in (spans[k] for k in s_idx.near(tb[1] - 4 * sz, tb[3] + 4 * sz))
+                if s[0] <= px0 + 0.5 and s[1] >= px1 - 0.5
                 and s[2] <= tb[3] + 4 * sz and s[3] >= tb[1] - 4 * sz]
         if near:
             x0s, x1s = min(near, key=lambda s: s[1] - s[0])[:2]
