@@ -1,0 +1,11 @@
+tests/
+__pycache__/
+.aws-sam/
+*.pyc
+node_modules/
+.wrangler/
+src/
+deploy/
+docs/
+.env
+.git/

@@ -1,0 +1,904 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PDF Editor</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%233b5bdb'/%3E%3Cpath d='M10 8h8l5 5v11a1 1 0 0 1-1 1H10a1 1 0 0 1-1-1V9a1 1 0 0 1 1-1z' fill='%23fff'/%3E%3Cpath d='M12 18h8M12 21h5' stroke='%233b5bdb' stroke-width='1.6' stroke-linecap='round'/%3E%3C/svg%3E">
+<style>
+  :root{
+    --bg:#f3f4f7; --surface:#fff; --ink:#1b2130; --muted:#667085; --line:#e2e5eb; --line-strong:#cfd4dc;
+    --accent:#3b5bdb; --accent-ink:#fff; --accent-soft:#eaefff; --accent-hover:#3049b8;
+    --warn-bg:#fff7e6; --warn-ink:#8a5300; --warn-line:#f5d9a3;
+    --danger:#c92a2a; --shadow:0 1px 2px rgba(16,24,40,.06),0 4px 16px rgba(16,24,40,.08);
+    --radius:10px;
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%}
+  body{margin:0;font:15px/1.5 "Segoe UI",system-ui,-apple-system,Roboto,sans-serif;background:var(--bg);color:var(--ink);
+       -webkit-font-smoothing:antialiased}
+  button{font:inherit;color:inherit}
+  [hidden]{display:none!important}
+
+  /* ---------- top bar ---------- */
+  .bar{position:sticky;top:0;z-index:20;display:flex;align-items:center;gap:12px;height:60px;padding:0 20px;
+       background:var(--surface);border-bottom:1px solid var(--line)}
+  .brand{display:flex;align-items:center;gap:10px;font-weight:650;font-size:16px;white-space:nowrap}
+  .brand svg{flex:none}
+  .docinfo{display:flex;align-items:center;gap:8px;min-width:0;padding-left:14px;margin-left:2px;border-left:1px solid var(--line);color:var(--muted);font-size:14px}
+  .docinfo b{color:var(--ink);font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:32vw}
+  .spacer{flex:1}
+  .actions{display:flex;align-items:center;gap:8px}
+  .btn{display:inline-flex;align-items:center;gap:7px;height:36px;padding:0 14px;border-radius:8px;border:1px solid var(--line-strong);
+       background:var(--surface);font-weight:600;font-size:14px;cursor:pointer;white-space:nowrap;transition:background .15s,border-color .15s}
+  .btn:hover{background:#f7f8fa}
+  .btn:focus-visible,.icon-btn:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+  .btn.primary{background:var(--accent);border-color:var(--accent);color:var(--accent-ink)}
+  .btn.primary:hover{background:var(--accent-hover)}
+  .btn.ghost{border-color:transparent;background:transparent;color:var(--muted)}
+  .btn.ghost:hover{background:#f1f3f6;color:var(--ink)}
+  .btn:disabled{opacity:.45;cursor:default;pointer-events:none}
+  .badge{min-width:20px;height:20px;padding:0 6px;border-radius:10px;background:rgba(255,255,255,.25);font-size:12px;line-height:20px;text-align:center}
+  .zoom{display:flex;align-items:center;border:1px solid var(--line-strong);border-radius:8px;height:36px;overflow:hidden}
+  .icon-btn{width:34px;height:34px;border:0;background:transparent;cursor:pointer;display:grid;place-items:center;color:var(--muted)}
+  .icon-btn:hover{background:#f1f3f6;color:var(--ink)}
+  .zoom span{min-width:48px;text-align:center;font-size:13px;font-variant-numeric:tabular-nums;color:var(--muted)}
+
+  /* ---------- hint + notice ---------- */
+  .hint{display:flex;align-items:center;gap:18px;flex-wrap:wrap;padding:9px 20px;background:var(--surface);border-bottom:1px solid var(--line);
+        font-size:13px;color:var(--muted)}
+  .hint kbd{font:600 11px/1 "Segoe UI",system-ui,sans-serif;padding:3px 6px;border:1px solid var(--line-strong);border-bottom-width:2px;border-radius:4px;background:#fafbfc;color:var(--ink)}
+  .hint .close{margin-left:auto}
+  .notice{display:flex;gap:10px;align-items:flex-start;margin:16px auto 0;max-width:900px;padding:12px 14px;border:1px solid var(--warn-line);
+          background:var(--warn-bg);color:var(--warn-ink);border-radius:var(--radius);font-size:14px}
+  .notice ul{margin:0;padding-left:18px}
+  .notice .close{margin-left:auto;color:var(--warn-ink)}
+
+  /* ---------- welcome / drop zone ---------- */
+  .welcome{min-height:calc(100vh - 60px);display:grid;place-items:center;padding:32px 16px}
+  .welcome-inner{width:100%;max-width:560px;text-align:center}
+  .welcome h1{font-size:30px;line-height:1.2;margin:0 0 10px;letter-spacing:-.01em}
+  .welcome p.lead{margin:0 0 28px;color:var(--muted);font-size:16px}
+  .drop{display:block;padding:44px 24px;border:2px dashed var(--line-strong);border-radius:16px;background:var(--surface);cursor:pointer;
+        transition:border-color .15s,background .15s}
+  .drop:hover,.drop.over{border-color:var(--accent);background:var(--accent-soft)}
+  .drop:focus-within{outline:2px solid var(--accent);outline-offset:3px}
+  .drop input{position:absolute;width:1px;height:1px;opacity:0}
+  .drop .ic{width:56px;height:56px;margin:0 auto 14px;border-radius:14px;background:var(--accent-soft);color:var(--accent);display:grid;place-items:center}
+  .drop strong{display:block;font-size:17px;margin-bottom:4px}
+  .drop span{color:var(--muted);font-size:14px}
+  .drop .btn{margin-top:18px;pointer-events:none}
+  .features{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-top:28px;text-align:left}
+  .feature{padding:14px;border-radius:var(--radius);background:var(--surface);border:1px solid var(--line);font-size:13px;color:var(--muted)}
+  .feature b{display:block;color:var(--ink);font-size:14px;margin-bottom:2px}
+  .privacy{margin-top:18px;font-size:13px;color:var(--muted);display:flex;gap:6px;align-items:center;justify-content:center}
+
+  /* ---------- pages ---------- */
+  .viewer{padding:28px 16px 80px;overflow-x:auto}
+  .page{position:relative;margin:0 auto 28px;background:#fff;box-shadow:var(--shadow);border-radius:2px}
+  .page img{display:block;width:100%;user-select:none;-webkit-user-drag:none}
+  .page-label{text-align:center;color:var(--muted);font-size:12px;margin:-18px 0 22px}
+  .no-preview{display:grid;place-items:center;color:var(--muted);font-size:14px}
+  .ln{position:absolute;white-space:pre-wrap;color:transparent;caret-color:var(--ink);outline:none;cursor:text;border-radius:2px;
+      transition:background .12s}
+  .page:not(.has-preview) .ln{color:var(--ink)}
+  .ln:hover{background:rgba(59,91,219,.10);box-shadow:0 0 0 1px rgba(59,91,219,.25)}
+  .ln:focus,.ln.changed{color:var(--c,#1b2130);background:#fff;box-shadow:0 0 0 1.5px var(--accent)}
+  .ln.changed:not(:focus){box-shadow:0 0 0 1.5px var(--accent),0 0 0 4px rgba(59,91,219,.15)}
+  .ln.empty:not(:focus){background:repeating-linear-gradient(135deg,#fff,#fff 4px,#fdecec 4px,#fdecec 8px);box-shadow:0 0 0 1.5px var(--danger)}
+  .add{position:absolute;z-index:3;width:22px;height:22px;padding:0;border-radius:50%;border:1.5px solid var(--accent);color:var(--accent);
+       background:#fff;display:grid;place-items:center;cursor:pointer;opacity:0;transition:opacity .15s,transform .15s;box-shadow:var(--shadow)}
+  .page:hover .add{opacity:.55}
+  .add:hover,.add:focus-visible{opacity:1!important;transform:scale(1.12);outline:none}
+  .add.has{opacity:1;background:var(--accent);color:#fff;font-size:11px;font-weight:700}
+  .ins-line{position:absolute;z-index:2;height:0;border-top:2px dashed var(--accent);pointer-events:none}
+  .ins-line span{position:absolute;right:0;top:-10px;padding:1px 8px;border-radius:9px;background:var(--accent);color:#fff;font-size:11px;font-weight:600;white-space:nowrap}
+
+  /* ---------- add-points popover ---------- */
+  .pop{position:absolute;z-index:10;width:340px;max-width:calc(100% - 8px);background:#fff;border:1px solid var(--line);border-radius:12px;
+       padding:14px;box-shadow:0 12px 32px rgba(16,24,40,.18)}
+  .pop h3{margin:0 0 8px;font-size:14px}
+  .pop textarea{width:100%;min-height:96px;resize:vertical;padding:8px 10px;border:1px solid var(--line-strong);border-radius:8px;font:inherit;font-size:14px}
+  .pop textarea:focus{outline:2px solid var(--accent);outline-offset:-1px;border-color:transparent}
+  .pop small{display:block;color:var(--muted);margin:6px 0 12px;font-size:12px}
+  .pop .row{display:flex;gap:8px;justify-content:flex-end}
+
+  /* ---------- busy overlay, toast, dialog ---------- */
+  .busy{position:fixed;inset:0;z-index:50;display:grid;place-items:center;background:rgba(243,244,247,.75);backdrop-filter:blur(2px)}
+  .busy-card{display:flex;align-items:center;gap:14px;padding:18px 22px;background:#fff;border-radius:12px;box-shadow:var(--shadow);font-weight:600}
+  .spin{width:22px;height:22px;border-radius:50%;border:3px solid var(--accent-soft);border-top-color:var(--accent);animation:spin .8s linear infinite}
+  @keyframes spin{to{transform:rotate(360deg)}}
+  .toast{position:fixed;left:50%;bottom:24px;z-index:60;transform:translateX(-50%) translateY(20px);opacity:0;pointer-events:none;
+         display:flex;align-items:center;gap:14px;max-width:calc(100% - 32px);padding:12px 16px;border-radius:10px;background:#1b2130;color:#fff;
+         font-size:14px;box-shadow:0 10px 30px rgba(0,0,0,.25);transition:opacity .2s,transform .2s}
+  .toast.show{opacity:1;transform:translateX(-50%);pointer-events:auto}
+  .toast.error{background:var(--danger)}
+  .toast button{border:0;background:transparent;color:#9fb4ff;font-weight:700;cursor:pointer;padding:0}
+  dialog{border:0;border-radius:14px;padding:22px;width:min(380px,calc(100% - 32px));box-shadow:0 20px 50px rgba(16,24,40,.25)}
+  dialog::backdrop{background:rgba(16,24,40,.35)}
+  dialog h3{margin:0 0 6px}
+  dialog p{margin:0 0 14px;color:var(--muted);font-size:14px}
+  dialog input{width:100%;height:40px;padding:0 12px;border:1px solid var(--line-strong);border-radius:8px;font:inherit;margin-bottom:16px}
+  dialog .row{display:flex;gap:8px;justify-content:flex-end}
+
+  /* ---------- add text / image / signature ---------- */
+  .addgroup{display:flex;gap:6px;padding-right:10px;margin-right:2px;border-right:1px solid var(--line)}
+  .addn{position:absolute;z-index:4;touch-action:none;outline:1.5px dashed transparent;outline-offset:3px;border-radius:2px}
+  .page:hover .addn{outline-color:rgba(59,91,219,.45)}
+  .addn.sel{outline:1.5px solid var(--accent)!important}
+  .addn.image,.addn.signature{cursor:move}
+  .addn img{display:block;width:100%;height:100%;object-fit:contain;pointer-events:none;user-select:none;-webkit-user-drag:none}
+  .addn-text{outline:none;white-space:pre-wrap;overflow-wrap:break-word;line-height:1.2;min-height:1.2em;cursor:text}
+  .addn-text:empty::before{content:"Type here";color:#98a2b3}
+  .addn .h{position:absolute;display:none;width:24px;height:24px;padding:0;border-radius:50%;border:2px solid #fff;background:var(--accent);
+           color:#fff;place-items:center;cursor:pointer;box-shadow:var(--shadow);z-index:2}
+  .addn.sel .h{display:grid}
+  .addn .h-del{top:-14px;right:-14px;background:var(--danger)}
+  .addn .h-size{bottom:-14px;right:-14px;cursor:nwse-resize}
+  .addn .h-move{top:-14px;left:-14px;cursor:move}
+  .fmt{position:sticky;top:60px;z-index:19;display:flex;align-items:center;gap:6px;height:48px;padding:0 20px;background:var(--surface);
+       border-bottom:1px solid var(--line);overflow-x:auto;scrollbar-width:none}
+  .fmt-label{font-size:12px;font-weight:650;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;min-width:104px;white-space:nowrap}
+  .fmt select,.fmt-size{height:32px;flex:none;border:1px solid var(--line-strong);border-radius:7px;background:#fff;font:inherit;font-size:14px;color:var(--ink)}
+  .fmt select{width:190px;padding:0 6px}
+  .fmt-size{display:flex;align-items:center;padding-right:8px;color:var(--muted);font-size:13px}
+  .fmt-size input{width:56px;height:100%;border:0;background:transparent;font:inherit;font-size:14px;color:var(--ink);padding:0 4px 0 10px;outline:none}
+  .fmt-size:focus-within,.fmt select:focus{outline:2px solid var(--accent);outline-offset:-1px}
+  .fbtn{width:32px;height:32px;flex:none;border:1px solid transparent;border-radius:7px;background:transparent;cursor:pointer;font-size:15px;color:var(--ink)}
+  .fbtn:hover{background:#f1f3f6}
+  .fbtn.on{background:var(--accent-soft);border-color:var(--accent);color:var(--accent)}
+  .fcolor{position:relative;width:32px;height:32px;flex:none;border-radius:7px;display:grid;place-items:center;cursor:pointer}
+  .fcolor:hover{background:#f1f3f6}
+  .fcolor b{font-size:15px;line-height:1;margin-top:-4px}
+  .fcolor i{position:absolute;left:7px;right:7px;bottom:6px;height:4px;border-radius:2px;background:var(--swatch,#000);box-shadow:0 0 0 1px rgba(0,0,0,.12)}
+  .fcolor input{position:absolute;inset:0;opacity:0;cursor:pointer;width:100%;height:100%;border:0;padding:0}
+  .fsep{width:1px;height:22px;background:var(--line);margin:0 4px;flex:none}
+  .fmt-note{margin-left:8px;font-size:13px;color:var(--muted);white-space:nowrap}
+  .fmt.ro select,.fmt.ro .fmt-size,.fmt.ro .fbtn,.fmt.ro .fcolor{pointer-events:none}
+  .fmt.ro select:disabled,.fmt.ro .fmt-size input:disabled{opacity:1;color:var(--ink)}
+  .fmt.ro .fmt-label{color:var(--accent)}
+  .fmt.off select,.fmt.off .fmt-size,.fmt.off .fbtn,.fmt.off .fcolor{opacity:.4;pointer-events:none}
+  dialog.sig{width:min(560px,calc(100% - 32px))}
+  .sig canvas{display:block;width:100%;height:200px;border:1px solid var(--line-strong);border-radius:10px;touch-action:none;cursor:crosshair;
+              background:linear-gradient(transparent 150px,#cfd4dc 150px,#cfd4dc 151px,transparent 151px) #fafbfc}
+  .sig-tools{display:flex;align-items:center;gap:8px;margin:10px 0 16px;font-size:13px;color:var(--muted)}
+  .sig-tools .ink{width:24px;height:24px;border-radius:50%;border:2px solid #fff;box-shadow:0 0 0 1px var(--line-strong);cursor:pointer;padding:0}
+  .sig-tools .ink.on{box-shadow:0 0 0 2px var(--accent)}
+  .sig-tools .btn{margin-left:auto}
+
+  @media (max-width:1180px){ .hide-md{display:none!important} }
+  @media (max-width:760px){
+    .addgroup{padding-right:6px;gap:4px}
+    .addgroup .btn,#openAnother{padding:0 10px}
+    .fmt{padding:0 12px}
+    .fmt-label,.fmt-note{display:none}
+    .fmt select{width:150px}
+    .actions{gap:6px}
+    .bar{padding:0 12px;gap:8px}
+    .docinfo,.zoom,.hide-sm{display:none!important}
+    .features{grid-template-columns:1fr}
+    .welcome h1{font-size:24px}
+    .hint{padding:8px 12px;gap:10px}
+  }
+</style>
+</head>
+<body>
+<header class="bar">
+  <div class="brand">
+    <svg width="28" height="28" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="8" fill="#3b5bdb"/><path d="M10 8h8l5 5v11a1 1 0 0 1-1 1H10a1 1 0 0 1-1-1V9a1 1 0 0 1 1-1z" fill="#fff"/><path d="M12 18h8M12 21h5" stroke="#3b5bdb" stroke-width="1.6" stroke-linecap="round"/></svg>
+    <span class="hide-sm">PDF Editor</span>
+  </div>
+  <div class="docinfo" id="docinfo" hidden><b id="docname"></b><span id="docpages"></span></div>
+  <div class="spacer"></div>
+  <div class="actions" id="actions" hidden>
+    <div class="zoom" role="group" aria-label="Zoom">
+      <button class="icon-btn" id="zoomOut" title="Zoom out" aria-label="Zoom out"><svg width="16" height="16" viewBox="0 0 16 16"><path d="M3 8h10" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg></button>
+      <span id="zoomLabel">100%</span>
+      <button class="icon-btn" id="zoomIn" title="Zoom in" aria-label="Zoom in"><svg width="16" height="16" viewBox="0 0 16 16"><path d="M3 8h10M8 3v10" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg></button>
+    </div>
+    <div class="addgroup" role="group" aria-label="Add to the page">
+      <button class="btn" id="addText" title="Add a text box">
+        <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M3 4V3h10v1M8 3v10m-2 0h4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        <span class="hide-md">Text</span>
+      </button>
+      <button class="btn" id="addImage" title="Add an image">
+        <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><rect x="2" y="3" width="12" height="10" rx="1.5" stroke="currentColor" stroke-width="1.5"/><circle cx="6" cy="6.5" r="1.2" fill="currentColor"/><path d="m2.5 12 3.5-3.5 2.5 2.5 2-2 3 3" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/></svg>
+        <span class="hide-md">Image</span>
+      </button>
+      <button class="btn" id="addSign" title="Add your signature">
+        <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M2 11.5c1.5-3 3-6.5 4.2-6.5 1.5 0-1.7 6.5 0 6.5 1.2 0 1.8-2.5 3-2.5.9 0 .6 1.8 1.6 1.8.6 0 1.1-.6 1.7-1" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/><path d="M2 14h12" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>
+        <span class="hide-md">Sign</span>
+      </button>
+    </div>
+    <input id="imgFile" type="file" accept="image/png,image/jpeg,image/webp,image/gif" hidden>
+    <button class="btn ghost hide-sm" id="discard" disabled>Discard changes</button>
+    <button class="btn" id="openAnother">
+      <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M2 4.5A1.5 1.5 0 0 1 3.5 3H6l1.5 1.5h5A1.5 1.5 0 0 1 14 6v5.5a1.5 1.5 0 0 1-1.5 1.5h-9A1.5 1.5 0 0 1 2 11.5z" stroke="currentColor" stroke-width="1.5"/></svg>
+      <span class="hide-sm hide-md">Open another</span>
+    </button>
+    <button class="btn primary" id="save" disabled>
+      <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M8 2v8m0 0L5 7m3 3 3-3M3 12.5h10" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      <span>Download<span class="hide-sm"> PDF</span></span> <span class="badge" id="count" hidden>0</span>
+    </button>
+  </div>
+</header>
+
+<div class="fmt" id="fmt" role="toolbar" aria-label="Text style" hidden>
+  <span class="fmt-label" id="fmtLabel">New text</span>
+  <select id="fFont" title="Font" aria-label="Font"></select>
+  <label class="fmt-size" title="Font size"><input id="fSize" type="number" min="4" max="96" step="0.5" aria-label="Font size">pt</label>
+  <span class="fsep"></span>
+  <button class="fbtn" id="fBold" title="Bold" aria-label="Bold" aria-pressed="false"><b>B</b></button>
+  <button class="fbtn" id="fItalic" title="Italic" aria-label="Italic" aria-pressed="false"><i style="font-family:Georgia,serif">I</i></button>
+  <label class="fcolor" id="fColorWrap" title="Text colour"><b>A</b><i></i><input type="color" id="fColor" aria-label="Text colour"></label>
+  <span class="fmt-note" id="fmtNote"></span>
+</div>
+
+<div class="hint" id="hint" hidden>
+  <span><b style="color:var(--ink)">Click any text</b> to change it</span>
+  <span class="hide-sm"><kbd>Enter</kbd> done</span>
+  <span class="hide-sm"><kbd>Shift</kbd> + <kbd>Enter</kbd> new line</span>
+  <span class="hide-sm"><kbd>Esc</kbd> undo</span>
+  <span class="hide-sm">Hover a list and click <b style="color:var(--accent)">+</b> to add points</span>
+  <span class="hide-sm">Use <b style="color:var(--ink)">Text</b>, <b style="color:var(--ink)">Image</b> or <b style="color:var(--ink)">Sign</b> to add something new</span>
+  <button class="btn ghost close" id="hideHint">Got it</button>
+</div>
+
+<main>
+  <section class="welcome" id="welcome">
+    <div class="welcome-inner">
+      <h1>Edit your PDF in seconds</h1>
+      <p class="lead">Change text, add points to lists, and add text boxes, images or your signature. The original fonts and layout stay as they are.</p>
+      <label class="drop" id="drop">
+        <input id="file" type="file" accept="application/pdf,.pdf">
+        <div class="ic"><svg width="28" height="28" viewBox="0 0 24 24" fill="none"><path d="M12 15V4m0 0L8 8m4-4 4 4M5 15v3a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-3" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+        <strong>Drop your PDF here</strong>
+        <span>or click to choose a file from your device</span><br>
+        <span class="btn primary">Choose PDF</span>
+      </label>
+      <div class="features">
+        <div class="feature"><b>Edit text</b>Click a line and type. It keeps the original look.</div>
+        <div class="feature"><b>Grow lists</b>Add new points to bulleted or numbered lists.</div>
+        <div class="feature"><b>Add &amp; sign</b>Place text boxes, images and your drawn signature anywhere.</div>
+      </div>
+      <div class="privacy">
+        <svg width="14" height="14" viewBox="0 0 16 16" fill="none"><rect x="3" y="7" width="10" height="7" rx="1.5" stroke="currentColor" stroke-width="1.5"/><path d="M5.5 7V5a2.5 2.5 0 0 1 5 0v2" stroke="currentColor" stroke-width="1.5"/></svg>
+        Your files are never stored. They're only used while you edit.
+      </div>
+    </div>
+  </section>
+
+  <div id="notice" class="notice" hidden>
+    <svg width="18" height="18" viewBox="0 0 20 20" fill="none" style="flex:none;margin-top:1px"><path d="M10 3 2 17h16L10 3z" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><path d="M10 8v4m0 2.5v.01" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+    <div><b id="noticeTitle">Your PDF was downloaded, with a few notes:</b><ul id="noticeList"></ul></div>
+    <button class="btn ghost close" id="hideNotice" aria-label="Dismiss">✕</button>
+  </div>
+  <section class="viewer" id="viewer" hidden></section>
+</main>
+
+<div class="busy" id="busy" hidden><div class="busy-card"><div class="spin"></div><span id="busyText">Working…</span></div></div>
+<div class="toast" id="toast" role="status"><span id="toastText"></span><button id="toastAction" hidden></button></div>
+
+<dialog id="keyDialog">
+  <form method="dialog" id="keyForm">
+    <h3>Access code required</h3>
+    <p>This editor is private. Enter the access code you were given.</p>
+    <input id="keyInput" type="password" autocomplete="off" placeholder="Access code" required>
+    <div class="row"><button class="btn ghost" value="cancel" formnovalidate>Cancel</button><button class="btn primary" value="ok">Continue</button></div>
+  </form>
+</dialog>
+
+<dialog id="sigDialog" class="sig">
+  <h3>Draw your signature</h3>
+  <p>Use your mouse, finger or a stylus.</p>
+  <canvas id="sigPad" aria-label="Signature pad"></canvas>
+  <div class="sig-tools">
+    <span>Ink</span>
+    <button class="ink on" data-c="#111827" style="background:#111827" aria-label="Black ink"></button>
+    <button class="ink" data-c="#1d3fbf" style="background:#1d3fbf" aria-label="Blue ink"></button>
+    <button class="btn ghost" id="sigLast" hidden>Use my last signature</button>
+    <button class="btn ghost" id="sigClear">Clear</button>
+  </div>
+  <div class="row"><button class="btn ghost" id="sigCancel">Cancel</button><button class="btn primary" id="sigOk" disabled>Add signature</button></div>
+</dialog>
+
+<script>
+// Opened by double-click (file://): talk to the local server.
+const API = location.protocol === "file:" ? "http://localhost:8080" : "";
+const PT = 96 / 72;                       // 100% zoom = actual size on screen
+const ZOOMS = [0.5, 0.67, 0.75, 0.9, 1, 1.1, 1.25, 1.5, 1.75, 2];
+
+const $ = s => document.querySelector(s);
+const store = { get: k => { try { return localStorage.getItem(k); } catch { return null; } },
+                set: (k, v) => { try { localStorage.setItem(k, v); } catch {} } };
+
+let pdfFile = null, doc = null, zoom = 1, accessCode = "";
+const edits = new Map();     // line id -> new text
+const inserts = new Map();   // "listId|itemIndex" -> new points (one per line)
+let added = [];              // new text boxes, images and signatures; rect is in PDF points
+let selectedId = null, addSeq = 0, lastSig = null;
+let newStyle = null;         // the style the next text box gets (picked up from the text you click)
+const lineById = new Map();
+
+// ---------- small UI helpers --------------------------------------------------
+let toastTimer;
+function toast(text, { error = false, action, onAction, ms = 4000 } = {}) {
+  $("#toastText").textContent = text;
+  $("#toast").classList.toggle("error", error);
+  const a = $("#toastAction"); a.hidden = !action; a.textContent = action || "";
+  a.onclick = () => { $("#toast").classList.remove("show"); onAction && onAction(); };
+  $("#toast").classList.add("show");
+  clearTimeout(toastTimer); toastTimer = setTimeout(() => $("#toast").classList.remove("show"), ms);
+}
+const busy = text => { $("#busy").hidden = !text; if (text) $("#busyText").textContent = text; };
+
+function fontFamily(name = "") {
+  const n = name.toLowerCase();
+  if (/carlito|calibri/.test(n)) return 'Calibri, Carlito, "Segoe UI", sans-serif';
+  if (/caladea|cambria/.test(n)) return "Cambria, Caladea, Georgia, serif";
+  if (/courier|mono|consol/.test(n)) return '"Courier New", monospace';
+  if (/times|georgia|garamond|minion|roman|(^|[^a-z])serif/.test(n) && !/sans/.test(n)) return '"Times New Roman", Times, serif';
+  return "Arial, Helvetica, sans-serif";
+}
+
+// ---------- talking to the server ---------------------------------------------
+async function call(path, form) {
+  for (;;) {
+    let res;
+    try {
+      res = await fetch(API + path, { method: "POST", body: form, headers: accessCode ? { "X-Api-Key": accessCode } : {} });
+    } catch {
+      throw new Error("Can't reach the editor right now. Check your connection and try again.");
+    }
+    if (res.status === 401) {                     // private deployment: ask for the access code once
+      busy(null);
+      const code = await askAccessCode(!!accessCode);
+      if (!code) throw new Error("An access code is needed to use this editor.");
+      accessCode = code; busy(path === "/edit" ? "Applying your changes…" : "Opening your document…");
+      continue;
+    }
+    if (res.ok) return res;
+    let msg = "";
+    try { msg = (await res.json()).error.message; } catch {}
+    if (res.status === 413) throw new Error(`This file is too large. ${msg}`);
+    if (res.status === 422 && msg) throw new Error(msg);
+    throw new Error(path === "/edit" ? "We couldn't apply your changes. Please try again."
+                                     : "We couldn't open this file. Please try another PDF.");
+  }
+}
+
+function askAccessCode(retry) {
+  return new Promise(resolve => {
+    const d = $("#keyDialog"), input = $("#keyInput");
+    d.querySelector("p").textContent = retry ? "That code didn't work. Please check it and try again."
+                                             : "This editor is private. Enter the access code you were given.";
+    input.value = "";
+    d.onclose = () => resolve(d.returnValue === "ok" ? input.value.trim() : "");
+    d.showModal(); input.focus();
+  });
+}
+
+// ---------- 1. open a PDF -----------------------------------------------------
+async function openFile(f) {
+  if (!f) return;
+  if (!/\.pdf$/i.test(f.name) && f.type !== "application/pdf") { toast("Please choose a PDF file.", { error: true }); return; }
+  if (pending() && !await confirmDiscard()) return;
+  busy("Opening your document…");
+  try {
+    const form = new FormData(); form.append("file", f);
+    const data = await (await call("/analyze?previews=true", form)).json();
+    doc = data; pdfFile = f; edits.clear(); inserts.clear(); clearAdded(); selectedId = null; setupFonts();
+    $("#docname").textContent = f.name;
+    $("#docpages").textContent = `· ${data.pages.length} page${data.pages.length === 1 ? "" : "s"}`;
+    $("#welcome").hidden = true; $("#fmt").hidden = false; $("#viewer").hidden = false; $("#actions").hidden = false; $("#docinfo").hidden = false;
+    $("#notice").hidden = true; $("#hint").hidden = store.get("hintSeen") === "1";
+    zoom = fitZoom(); render(); refresh(); window.scrollTo(0, 0);
+    if (data.signed) showNotice("This PDF is digitally signed:",
+      ["Saving any change will make its existing digital signature invalid."]);
+    if (!data.hasText) toast("This PDF is a scanned image, so its text can't be edited. You can still add text, images and a signature.", { error: true, ms: 7000 });
+  } catch (e) { toast(e.message, { error: true, ms: 6000 }); }
+  finally { busy(null); $("#file").value = ""; }
+}
+
+$("#file").addEventListener("change", e => openFile(e.target.files[0]));
+$("#openAnother").onclick = () => $("#file").click();
+["dragenter", "dragover"].forEach(t => addEventListener(t, e => { e.preventDefault(); $("#drop").classList.add("over"); }));
+["dragleave", "drop"].forEach(t => addEventListener(t, e => { e.preventDefault(); if (t === "drop" || !e.relatedTarget) $("#drop").classList.remove("over"); }));
+addEventListener("drop", e => openFile(e.dataTransfer.files[0]));
+
+// ---------- 2. draw the pages -------------------------------------------------
+function fitZoom() {
+  const avail = Math.max(280, $("#viewer").clientWidth - 32);
+  const widest = Math.max(...doc.pages.map(p => p.width)) * PT;
+  return Math.min(1.25, avail / widest);
+}
+
+function render() {
+  const Z = zoom * PT, viewer = $("#viewer");
+  $("#zoomLabel").textContent = Math.round(zoom * 100) + "%";
+  document.querySelector(".pop")?.remove();
+  viewer.innerHTML = "";
+  doc.pages.forEach(page => {
+    const el = document.createElement("div");
+    el.className = "page" + (page.preview ? " has-preview" : "");
+    el.style.width = page.width * Z + "px";
+    el.innerHTML = page.preview
+      ? `<img alt="Page ${page.index + 1}" src="${page.preview}">`
+      : `<div class="no-preview" style="height:${page.height * Z}px"></div>`;
+
+    // bullet symbols on their own aren't text people want to edit
+    page.lines.filter(l => l.editable && /[\p{L}\p{N}]/u.test(l.text)).forEach(line => el.appendChild(lineBox(line, Z)));
+
+    page.lists.forEach(list => list.items.forEach(item => {
+      const key = `${list.id}|${item.index}`, added = inserts.has(key) ? points(inserts.get(key)) : null;
+      const btn = document.createElement("button");
+      btn.className = "add" + (added ? " has" : "");
+      btn.title = added ? "New points:\n" + added.join("\n") + "\n\nClick to change" : "Add points below";
+      btn.setAttribute("aria-label", added ? `${added.length} new points below. Click to change` : "Add points below this one");
+      btn.innerHTML = added ? String(added.length)
+        : '<svg width="12" height="12" viewBox="0 0 12 12"><path d="M6 2v8M2 6h8" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>';
+      btn.style.left = Math.max(2, list.markerX * Z - 30) + "px";
+      btn.style.top = (item.bbox[1] * Z + Math.min(item.bbox[3] - item.bbox[1], list.linePitch) * Z / 2 - 11) + "px";
+      btn.onclick = () => openPop(el, list, item, Z);
+      el.appendChild(btn);
+      if (added) {                       // a dashed line marks where the new points will go
+        const ln = document.createElement("div"); ln.className = "ins-line";
+        Object.assign(ln.style, { left: list.markerX * Z + "px", width: (list.right - list.markerX) * Z + "px", top: (item.bbox[3] + 1.5) * Z + "px" });
+        ln.innerHTML = `<span>+ ${added.length} new point${added.length === 1 ? "" : "s"}</span>`;
+        el.appendChild(ln);
+      }
+    }));
+    added.filter(a => a.page === page.index).forEach(a => el.appendChild(addBox(a, Z)));
+    viewer.appendChild(el);
+    const label = document.createElement("div");
+    label.className = "page-label"; label.textContent = `Page ${page.index + 1} of ${doc.pages.length}`;
+    viewer.appendChild(label);
+  });
+  viewer.querySelectorAll(".addn.text").forEach(b => b._sync());   // text height needs the page on screen
+  updateFmt();
+}
+const points = text => text.split("\n").filter(s => s.trim());
+
+function lineBox(line, Z) {
+  const [x0, y0, x1, y1] = line.bbox;
+  const box = document.createElement("div");
+  box.className = "ln"; box.dataset.id = line.id; box.spellcheck = true; box.setAttribute("role", "textbox");
+  try { box.contentEditable = "plaintext-only"; } catch { box.contentEditable = "true"; }
+  if (box.contentEditable !== "plaintext-only") box.contentEditable = "true";
+  box.textContent = edits.has(line.id) ? edits.get(line.id) : line.text;
+  Object.assign(box.style, {
+    left: x0 * Z + "px", top: y0 * Z + "px",
+    minWidth: (x1 - x0) * Z + "px", maxWidth: (Math.max(line.maxRight || x1, x1) - x0) * Z + 4 + "px",
+    minHeight: (y1 - y0) * Z + "px", lineHeight: (y1 - y0) * Z + "px",
+    font: `${line.italic ? "italic " : ""}${line.bold ? 700 : 400} ${line.size * Z}px ${fontFamily(line.font)}`,
+  });
+  box.style.setProperty("--c", line.color || "#000");
+  const mark = () => {
+    box.classList.toggle("changed", edits.has(line.id));
+    box.classList.toggle("empty", edits.get(line.id) === "");
+    box.title = edits.get(line.id) === "" ? "This line will be removed" : "";
+  };
+  mark();
+  box.addEventListener("keydown", e => {
+    if (e.key === "Enter" && (e.shiftKey || e.ctrlKey || e.metaKey)) {   // new line in the same paragraph
+      e.preventDefault(); document.execCommand("insertText", false, "\n"); return;
+    }
+    if (e.key === "Enter") { e.preventDefault(); box.blur(); }
+    if (e.key === "Escape") { box.textContent = line.text; edits.delete(line.id); mark(); refresh(); box.blur(); }
+  });
+  box.addEventListener("paste", e => {                                   // paste as plain text
+    e.preventDefault(); document.execCommand("insertText", false, (e.clipboardData.getData("text/plain") || "").replace(/\r/g, ""));
+  });
+  box.addEventListener("input", () => {
+    const t = box.innerText.replace(/\n$/, "");
+    if (t === line.text) edits.delete(line.id); else edits.set(line.id, t);
+    mark(); refresh();
+  });
+  return box;
+}
+
+// ---------- 3. adding points to lists -----------------------------------------
+function openPop(pageEl, list, item, Z) {
+  document.querySelector(".pop")?.remove();
+  const key = `${list.id}|${item.index}`;
+  const pop = document.createElement("div"); pop.className = "pop";
+  pop.style.left = Math.min(Math.max(4, list.markerX * Z), pageEl.clientWidth - 348) + "px";
+  pop.style.top = (item.bbox[3] * Z + 8) + "px";
+  pop.innerHTML = `<h3>Add points below</h3>
+    <textarea placeholder="New point&#10;- a sub-point&#10;Another point"></textarea>
+    <small>Each line becomes a new point. Start a line with a dash ( - ) to indent it under the point above.</small>
+    <div class="row"><button class="btn ghost" style="color:var(--danger);margin-right:auto">Remove</button>
+      <button class="btn ghost">Cancel</button><button class="btn primary">Add points</button></div>`;
+  const ta = pop.querySelector("textarea"); ta.value = inserts.get(key) || "";
+  const [remove, cancel, add] = pop.querySelectorAll("button");
+  remove.hidden = !inserts.has(key);
+  if (inserts.has(key)) { pop.querySelector("h3").textContent = "New points below"; add.textContent = "Save"; }
+  remove.onclick = () => { inserts.delete(key); render(); refresh(); };
+  add.onclick = () => { ta.value.trim() ? inserts.set(key, ta.value) : inserts.delete(key); render(); refresh(); };
+  cancel.onclick = () => pop.remove();
+  ta.addEventListener("keydown", e => {
+    if (e.key === "Escape") pop.remove();
+    if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) add.onclick();
+  });
+  pageEl.appendChild(pop); ta.focus();
+}
+
+// ---------- 4. add text boxes, images and signatures --------------------------
+const FONTS = { sans: "Arial, Helvetica, sans-serif", serif: '"Times New Roman", Times, serif', mono: '"Courier New", monospace' };
+const clamp = (v, lo, hi) => Math.min(Math.max(v, lo), Math.max(lo, hi));
+const ICON = {
+  del: '<svg width="10" height="10" viewBox="0 0 10 10"><path d="m2 2 6 6M8 2 2 8" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>',
+  size: '<svg width="10" height="10" viewBox="0 0 10 10"><path d="M3 8h5V3" stroke="currentColor" stroke-width="1.6" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+  move: '<svg width="12" height="12" viewBox="0 0 12 12"><path d="M6 1v10M1 6h10M6 1 4.5 2.5M6 1l1.5 1.5M6 11l-1.5-1.5M6 11l1.5-1.5M1 6l1.5-1.5M1 6l1.5 1.5M11 6 9.5 4.5M11 6 9.5 7.5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>',
+};
+
+function clearAdded() { added.forEach(a => a.url && URL.revokeObjectURL(a.url)); added = []; }
+
+// The page most visible on screen, and the vertical middle of its visible part (in points).
+function visibleSpot() {
+  const els = [...document.querySelectorAll(".page")], top = ($("#fmt").hidden ? $(".bar") : $("#fmt")).getBoundingClientRect().bottom;
+  let best = 0, bestArea = -Infinity;
+  els.forEach((el, i) => { const r = el.getBoundingClientRect(), a = Math.min(r.bottom, innerHeight) - Math.max(r.top, top); if (a > bestArea) { bestArea = a; best = i; } });
+  const r = els[best].getBoundingClientRect(), Z = zoom * PT;
+  return { page: best, cy: ((Math.max(r.top, top) + Math.min(r.bottom, innerHeight)) / 2 - r.top) / Z };
+}
+
+function addItem(item, w, h) {
+  const spot = visibleSpot(), page = doc.pages[spot.page];
+  if (page.rotated) { toast("Content can't be added to pages that are turned sideways.", { error: true }); return; }
+  w = Math.min(w, page.width * 0.8); h = item.type === "text" ? h : w * (item.h / item.w);
+  const x0 = (page.width - w) / 2, y0 = clamp(spot.cy - h / 2, 0, page.height - h);
+  const a = { id: `add-${++addSeq}`, page: spot.page, rect: [x0, y0, x0 + w, y0 + h], ...item };
+  added.push(a); selectedId = a.id; render(); refresh();
+  if (a.type === "text") document.querySelector(`.addn[data-id="${a.id}"] .addn-text`)?.focus();
+  return a;
+}
+
+$("#addText").onclick = () => addItem({ type: "text", text: "", ...newStyle }, 220, newStyle.size * 1.2);
+
+$("#addImage").onclick = () => $("#imgFile").click();
+$("#imgFile").addEventListener("change", async e => {
+  const f = e.target.files[0]; e.target.value = "";
+  if (!f) return;
+  try {
+    const img = await loadImage(f);
+    addItem({ type: "image", ...img }, 180);
+  } catch { toast("This image can't be used. Please choose a JPG or PNG.", { error: true }); }
+});
+
+// Shrink big photos (phones take 4000+ px) and keep transparency for PNGs.
+async function loadImage(file, maxPx = 2000) {
+  const src = URL.createObjectURL(file);
+  try {
+    const img = await new Promise((ok, fail) => { const i = new Image(); i.onload = () => ok(i); i.onerror = fail; i.src = src; });
+    const s = Math.min(1, maxPx / Math.max(img.naturalWidth, img.naturalHeight));
+    const c = document.createElement("canvas");
+    c.width = Math.max(1, Math.round(img.naturalWidth * s)); c.height = Math.max(1, Math.round(img.naturalHeight * s));
+    c.getContext("2d").drawImage(img, 0, 0, c.width, c.height);
+    const png = file.type !== "image/jpeg";
+    const blob = await new Promise(ok => c.toBlob(ok, png ? "image/png" : "image/jpeg", 0.88));
+    return { blob, url: URL.createObjectURL(blob), w: c.width, h: c.height };
+  } finally { URL.revokeObjectURL(src); }
+}
+
+function position(box, a, Z) {
+  const [x0, y0, x1, y1] = a.rect;
+  Object.assign(box.style, { left: x0 * Z + "px", top: y0 * Z + "px", width: (x1 - x0) * Z + "px",
+                             height: a.type === "text" ? "auto" : (y1 - y0) * Z + "px" });
+}
+
+function addBox(a, Z) {
+  const box = document.createElement("div");
+  box.className = `addn ${a.type}` + (a.id === selectedId ? " sel" : "");
+  box.dataset.id = a.id;
+  position(box, a, Z);
+  box.innerHTML = `<button class="h h-del" title="Remove" aria-label="Remove">${ICON.del}</button>
+                   <button class="h h-size" title="Resize" aria-label="Resize">${ICON.size}</button>`;
+  box.querySelector(".h-del").onclick = e => { e.stopPropagation(); removeAdded(a.id); };
+  box.querySelector(".h-size").addEventListener("pointerdown", e => startDrag(e, a, box, "size"));
+
+  if (a.type === "text") {
+    const txt = document.createElement("div");
+    txt.className = "addn-text"; txt.spellcheck = true; txt.setAttribute("role", "textbox");
+    try { txt.contentEditable = "plaintext-only"; } catch {}
+    if (txt.contentEditable !== "plaintext-only") txt.contentEditable = "true";
+    txt.textContent = a.text;
+    const style = box._style = () => Object.assign(txt.style, {
+      font: `${a.italic ? "italic " : ""}${a.bold ? 700 : 400} ${a.size * Z}px/1.2 ${cssFamily(a)}`, color: a.color });
+    style();
+    box._sync = () => { a.rect[3] = a.rect[1] + Math.max(txt.offsetHeight / Z, a.size * 1.2); };
+    txt.addEventListener("pointerdown", () => select(a.id));
+    txt.addEventListener("input", () => { a.text = txt.innerText.replace(/\n$/, ""); box._sync(); refresh(); });
+    txt.addEventListener("paste", e => {
+      e.preventDefault(); document.execCommand("insertText", false, (e.clipboardData.getData("text/plain") || "").replace(/\r/g, ""));
+    });
+
+    const mv = document.createElement("button");
+    mv.className = "h h-move"; mv.title = "Move"; mv.setAttribute("aria-label", "Move"); mv.innerHTML = ICON.move;
+    mv.addEventListener("pointerdown", e => startDrag(e, a, box, "move"));
+
+    box.append(txt, mv);
+  } else {
+    const img = document.createElement("img");
+    img.src = a.url; img.alt = a.type === "signature" ? "Your signature" : "Added image";
+    box.appendChild(img);
+    box.addEventListener("pointerdown", e => { if (!e.target.closest(".h")) startDrag(e, a, box, "move"); });
+  }
+  return box;
+}
+
+function select(id) {
+  if (selectedId === id) return;
+  const prev = added.find(a => a.id === selectedId);
+  selectedId = id;
+  if (prev && prev.type === "text" && !prev.text.trim()) { removeAdded(prev.id, true); return; }   // empty box: drop it
+  document.querySelectorAll(".addn").forEach(b => b.classList.toggle("sel", b.dataset.id === id));
+  updateFmt();
+}
+
+function removeAdded(id, quiet) {
+  const i = added.findIndex(a => a.id === id);
+  if (i < 0) return;
+  const [a] = added.splice(i, 1);
+  if (selectedId === id) selectedId = null;
+  render(); refresh();
+  if (!quiet) toast(a.type === "text" ? "Text box removed." : a.type === "image" ? "Image removed." : "Signature removed.",
+    { action: "Undo", onAction: () => { added.splice(i, 0, a); render(); refresh(); } });
+}
+
+// Move a box, or resize it from its corner (images keep their shape; text boxes change width).
+function startDrag(e, a, box, mode) {
+  e.preventDefault(); e.stopPropagation();
+  document.activeElement?.blur?.();
+  select(a.id);
+  const Z = zoom * PT, page = doc.pages[a.page], sx = e.clientX, sy = e.clientY, r0 = [...a.rect];
+  const w0 = r0[2] - r0[0], h0 = r0[3] - r0[1], ratio = w0 / h0;
+  const move = ev => {
+    const dx = (ev.clientX - sx) / Z, dy = (ev.clientY - sy) / Z;
+    if (mode === "move") {
+      const x0 = clamp(r0[0] + dx, 0, page.width - w0), y0 = clamp(r0[1] + dy, 0, page.height - h0);
+      a.rect = [x0, y0, x0 + w0, y0 + h0];
+    } else if (a.type === "text") {
+      a.rect = [r0[0], r0[1], r0[0] + clamp(w0 + dx, 30, page.width - r0[0]), r0[3]];
+    } else {
+      let w = clamp(w0 + Math.max(dx, dy * ratio), 16, page.width - r0[0]), h = w / ratio;
+      if (r0[1] + h > page.height) { h = page.height - r0[1]; w = h * ratio; }
+      a.rect = [r0[0], r0[1], r0[0] + w, r0[1] + h];
+    }
+    position(box, a, Z);
+    if (a.type === "text") box._sync();
+  };
+  const up = () => { removeEventListener("pointermove", move); removeEventListener("pointerup", up); refresh(); };
+  addEventListener("pointermove", move); addEventListener("pointerup", up);
+}
+
+document.addEventListener("pointerdown", e => { if (selectedId && !e.target.closest(".addn, .addgroup, .fmt, dialog")) select(null); });
+document.addEventListener("keydown", e => {
+  if (selectedId && (e.key === "Delete" || e.key === "Backspace") && !e.target.closest("[contenteditable], input, textarea, select")) {
+    e.preventDefault(); removeAdded(selectedId);
+  }
+  if (e.key === "Escape" && selectedId && !$("#sigDialog").open) { document.activeElement?.blur?.(); select(null); }
+});
+
+// ---------- format bar: shows the style of the text you click, edits text boxes ---
+const fontKey = name => { const f = name.split("+").pop().split(/[-,]/)[0]; return f.replace(/(PSMT|MT|PS)$/, "") || f; };
+const prettyFont = name => fontKey(name).replace(/([a-z])([A-Z])/g, "$1 $2");
+const isBold = l => l.bold || /bold|black|heavy/i.test(l.font.split("+").pop());
+const isItalic = l => l.italic || /italic|oblique/i.test(l.font.split("+").pop());
+const half = v => Math.round(v * 2) / 2;
+const isWords = l => l.editable && /[\p{L}\p{N}]/u.test(l.text);
+let docFonts = new Map();    // font family -> a line using it (a regular one if there is)
+
+function cssFamily(a) { return a.font === "doc" ? fontFamily(lineById.get(a.fontFrom)?.font) : FONTS[a.font]; }
+
+function styleOfLine(l) {
+  const fam = docFonts.get(fontKey(l.font));
+  return { font: fam ? "doc" : "sans", fontFrom: fam ? fam.lineId : null, size: half(l.size),
+           bold: isBold(l), italic: isItalic(l), color: l.color || "#000000" };
+}
+
+function setupFonts() {
+  lineById.clear(); docFonts = new Map();
+  const use = new Map();                                  // most used font + size = the body text
+  doc.pages.forEach(p => p.lines.forEach(l => {
+    lineById.set(l.id, l);
+    if (!isWords(l)) return;
+    const k = fontKey(l.font), f = docFonts.get(k) || { lineId: l.id, chars: 0, regular: false };
+    f.chars += l.text.length;
+    if (!f.regular && !isBold(l) && !isItalic(l)) Object.assign(f, { lineId: l.id, regular: true });
+    docFonts.set(k, f);
+    const u = `${k}|${half(l.size)}|${isBold(l)}`;
+    use.set(u, { n: (use.get(u)?.n || 0) + l.text.length, line: use.get(u)?.line || l });
+  }));
+  docFonts = new Map([...docFonts].sort((a, b) => b[1].chars - a[1].chars));
+  const opt = (v, t) => `<option value="${v}">${t.replace(/[&<>"]/g, c => `&#${c.charCodeAt(0)};`)}</option>`;
+  $("#fFont").innerHTML = (docFonts.size ? `<optgroup label="In this document">${[...docFonts].map(([k, f]) => opt("doc:" + f.lineId, prettyFont(k))).join("")}</optgroup>` : "")
+    + `<optgroup label="Standard">${opt("sans", "Sans")}${opt("serif", "Serif")}${opt("mono", "Mono")}</optgroup>`;
+  const body = [...use.values()].sort((a, b) => b.n - a.n)[0];
+  newStyle = body ? { ...styleOfLine(body.line), bold: false, italic: false }
+                  : { font: "sans", fontFrom: null, size: 12, bold: false, italic: false, color: "#000000" };
+}
+
+function fmtState() {
+  const ln = document.activeElement?.closest?.(".ln");
+  if (ln && lineById.has(ln.dataset.id)) return { kind: "line", line: lineById.get(ln.dataset.id) };
+  const a = added.find(x => x.id === selectedId);
+  if (a) return { kind: a.type === "text" ? "box" : "other", a };
+  return { kind: "new" };
+}
+
+function updateFmt() {
+  if (!doc || !newStyle) return;
+  const st = fmtState();
+  let s = newStyle, label = "New text", note = "Click any text in the document to see its font and size";
+  if (st.kind === "line") {
+    s = newStyle = styleOfLine(st.line);                  // like Word's format painter: new text boxes match
+    label = "Selected text"; note = "New text boxes will use this style";
+  } else if (st.kind === "box") { s = st.a; label = "Text box"; note = ""; }
+  else if (st.kind === "other") { label = st.a.type === "image" ? "Image" : "Signature"; note = "Select text to see its style"; }
+  const bar = $("#fmt");
+  bar.classList.toggle("ro", st.kind === "line"); bar.classList.toggle("off", st.kind === "other");
+  bar.querySelectorAll("select, input").forEach(c => c.disabled = st.kind === "line" || st.kind === "other");
+  $("#fmtLabel").textContent = label; $("#fmtNote").textContent = note;
+  $("#fFont").value = s.font === "doc" ? "doc:" + s.fontFrom : s.font;
+  $("#fSize").value = s.size;
+  [["#fBold", s.bold], ["#fItalic", s.italic]].forEach(([id, on]) => { $(id).classList.toggle("on", on); $(id).setAttribute("aria-pressed", on); });
+  $("#fColor").value = s.color; $("#fColorWrap").style.setProperty("--swatch", s.color);
+}
+
+function fmtApply(change) {
+  const st = fmtState();
+  if (st.kind === "line" || st.kind === "other") return;
+  Object.assign(st.kind === "box" ? st.a : newStyle, change);
+  if (st.kind === "box") {
+    const box = document.querySelector(`.addn[data-id="${st.a.id}"]`);
+    box?._style(); box?._sync(); refresh();
+  }
+  updateFmt();
+}
+$("#fFont").onchange = e => { const v = e.target.value; fmtApply(v.startsWith("doc:") ? { font: "doc", fontFrom: v.slice(4) } : { font: v, fontFrom: null }); };
+$("#fSize").addEventListener("change", e => fmtApply({ size: half(clamp(+e.target.value || 12, 4, 96)) }));
+$("#fSize").addEventListener("input", e => { const v = +e.target.value; if (v >= 4 && v <= 96) fmtApply({ size: v }); });
+$("#fBold").onclick = () => fmtApply({ bold: $("#fBold").getAttribute("aria-pressed") !== "true" });
+$("#fItalic").onclick = () => fmtApply({ italic: $("#fItalic").getAttribute("aria-pressed") !== "true" });
+$("#fColor").addEventListener("input", e => fmtApply({ color: e.target.value }));
+$("#fmt").addEventListener("mousedown", e => { if (e.target.closest("button")) e.preventDefault(); });   // keep typing in the box
+document.addEventListener("focusin", updateFmt);
+document.addEventListener("focusout", () => setTimeout(updateFmt));
+
+// ---------- signature pad -----------------------------------------------------
+const pad = { ink: "#111827", strokes: 0, box: null };
+$("#addSign").onclick = () => {
+  const d = $("#sigDialog"), c = $("#sigPad");
+  d.showModal();
+  const dpr = devicePixelRatio || 1;
+  c.width = c.clientWidth * dpr; c.height = c.clientHeight * dpr;
+  const ctx = c.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.lineCap = ctx.lineJoin = "round"; ctx.lineWidth = 2.6;
+  pad.ctx = ctx; pad.strokes = 0; pad.box = null;
+  $("#sigOk").disabled = true; $("#sigLast").hidden = !lastSig;
+};
+(() => {
+  const c = $("#sigPad");
+  let last = null, mid = null;
+  const at = e => { const r = c.getBoundingClientRect(); return [e.clientX - r.left, e.clientY - r.top]; };
+  const grow = ([x, y]) => {
+    const b = pad.box || [x, y, x, y];
+    pad.box = [Math.min(b[0], x), Math.min(b[1], y), Math.max(b[2], x), Math.max(b[3], y)];
+  };
+  c.addEventListener("pointerdown", e => {
+    c.setPointerCapture(e.pointerId); last = mid = at(e); grow(last);
+    pad.ctx.strokeStyle = pad.ink; pad.ctx.beginPath(); pad.ctx.arc(last[0], last[1], 1.2, 0, 7); pad.ctx.fillStyle = pad.ink; pad.ctx.fill();
+  });
+  c.addEventListener("pointermove", e => {
+    if (!last) return;
+    const p = at(e), m = [(last[0] + p[0]) / 2, (last[1] + p[1]) / 2];
+    pad.ctx.beginPath(); pad.ctx.moveTo(mid[0], mid[1]); pad.ctx.quadraticCurveTo(last[0], last[1], m[0], m[1]); pad.ctx.stroke();
+    last = p; mid = m; grow(p);
+  });
+  const end = () => { if (last) { pad.strokes++; $("#sigOk").disabled = false; } last = null; };
+  c.addEventListener("pointerup", end); c.addEventListener("pointercancel", end);
+})();
+document.querySelectorAll("#sigDialog .ink").forEach(b => b.onclick = () => {
+  pad.ink = b.dataset.c; document.querySelectorAll("#sigDialog .ink").forEach(x => x.classList.toggle("on", x === b));
+});
+$("#sigClear").onclick = () => { const c = $("#sigPad"); pad.ctx.clearRect(0, 0, c.width, c.height); pad.strokes = 0; pad.box = null; $("#sigOk").disabled = true; };
+$("#sigCancel").onclick = () => $("#sigDialog").close();
+$("#sigLast").onclick = () => { $("#sigDialog").close(); placeSignature(lastSig); };
+$("#sigOk").onclick = async () => {
+  // Crop to the ink so the signature box fits it tightly; the background stays transparent.
+  const c = $("#sigPad"), dpr = devicePixelRatio || 1, pad8 = 6;
+  const [x0, y0, x1, y1] = pad.box.map((v, i) => i < 2 ? Math.max(0, v - pad8) : v + pad8).map(v => Math.round(v * dpr));
+  const out = document.createElement("canvas");
+  out.width = Math.max(1, Math.min(c.width, x1) - x0); out.height = Math.max(1, Math.min(c.height, y1) - y0);
+  out.getContext("2d").drawImage(c, x0, y0, out.width, out.height, 0, 0, out.width, out.height);
+  const blob = await new Promise(ok => out.toBlob(ok, "image/png"));
+  lastSig = { blob, w: out.width, h: out.height };
+  $("#sigDialog").close();
+  placeSignature(lastSig);
+};
+function placeSignature(sig) {
+  addItem({ type: "signature", blob: sig.blob, url: URL.createObjectURL(sig.blob), w: sig.w, h: sig.h }, 150);
+}
+
+// ---------- toolbar -----------------------------------------------------------
+const pending = () => edits.size + inserts.size + added.length;
+function refresh() {
+  const n = pending();
+  $("#save").disabled = !n; $("#discard").disabled = !n;
+  $("#count").hidden = !n; $("#count").textContent = n;
+  $("#save").title = n ? `Download with ${n} change${n === 1 ? "" : "s"}` : "Make a change first";
+}
+
+function setZoom(z) {
+  const y = scrollY / document.body.scrollHeight;
+  zoom = Math.min(2, Math.max(0.5, z)); render(); window.scrollTo(0, y * document.body.scrollHeight);
+}
+$("#zoomIn").onclick = () => setZoom(ZOOMS.find(z => z > zoom + 0.01) || 2);
+$("#zoomOut").onclick = () => setZoom([...ZOOMS].reverse().find(z => z < zoom - 0.01) || 0.5);
+
+$("#discard").onclick = () => {
+  const saved = [new Map(edits), new Map(inserts), added];
+  edits.clear(); inserts.clear(); added = []; selectedId = null; render(); refresh();
+  toast("All changes discarded.", { action: "Undo", onAction: () => {
+    saved[0].forEach((v, k) => edits.set(k, v)); saved[1].forEach((v, k) => inserts.set(k, v)); added = saved[2]; render(); refresh();
+  }});
+};
+function confirmDiscard() {
+  return new Promise(resolve => {
+    toast("You have unsaved changes. Opening another file will discard them.", {
+      action: "Discard and continue", ms: 8000, onAction: () => resolve(true) });
+    setTimeout(() => resolve(false), 8100);
+  });
+}
+$("#hideHint").onclick = () => { $("#hint").hidden = true; store.set("hintSeen", "1"); };
+$("#hideNotice").onclick = () => { $("#notice").hidden = true; };
+addEventListener("resize", () => { if (doc && Math.abs(fitZoom() - zoom) > 0.02 && innerWidth < 760) { zoom = fitZoom(); render(); } });
+addEventListener("beforeunload", e => { if (pending()) { e.preventDefault(); e.returnValue = ""; } });
+document.addEventListener("click", e => {
+  const pop = document.querySelector(".pop");
+  if (pop && !pop.contains(e.target) && !e.target.closest(".add")) pop.remove();
+});
+
+function showNotice(title, notes) {
+  $("#noticeTitle").textContent = title;
+  $("#noticeList").innerHTML = ""; notes.forEach(n => $("#noticeList").appendChild(Object.assign(document.createElement("li"), { textContent: n })));
+  $("#notice").hidden = !notes.length;
+}
+
+// ---------- 5. apply changes and download -------------------------------------
+$("#save").addEventListener("click", async () => {
+  document.activeElement?.blur?.();
+  const r2 = v => Math.round(v * 100) / 100;
+  const body = {
+    edits: [...edits].map(([lineId, text]) => ({ lineId, text })),
+    inserts: [...inserts].map(([key, text]) => {
+      const [listId, afterItem] = key.split("|");
+      return { listId, afterItem: +afterItem, items: points(text) };
+    }),
+    additions: added.map(a => a.type === "text"
+      ? { type: "text", page: a.page, rect: a.rect.map(r2), text: a.text, font: a.font, ...(a.font === "doc" ? { fontFrom: a.fontFrom } : {}),
+          size: a.size, color: a.color, bold: a.bold, italic: a.italic }
+      : { type: a.type, page: a.page, rect: a.rect.map(r2), imageId: a.id }),
+  };
+  busy("Applying your changes…");
+  try {
+    const form = new FormData(); form.append("file", pdfFile); form.append("changes", JSON.stringify(body));
+    added.forEach(a => a.blob && form.append("images", a.blob, a.id));
+    const res = await call("/edit", form);
+    let notes = [];
+    try { notes = JSON.parse(res.headers.get("X-Edit-Warnings") || "[]"); } catch {}
+    const url = URL.createObjectURL(await res.blob());
+    const a = Object.assign(document.createElement("a"), { href: url, download: pdfFile.name.replace(/\.pdf$/i, "") + " (edited).pdf" });
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 60000);
+    showNotice("Your PDF was downloaded, with a few notes:", notes);
+    if (!notes.length) toast("Done! Your edited PDF has been downloaded.");
+    else window.scrollTo({ top: 0, behavior: "smooth" });
+  } catch (e) { toast(e.message, { error: true, ms: 6000 }); }
+  finally { busy(null); }
+});
+</script>
+</body>
+</html>
