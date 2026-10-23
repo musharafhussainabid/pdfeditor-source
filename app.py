@@ -16,6 +16,7 @@ import re
 import sys
 import time
 import uuid
+from datetime import datetime, timezone
 
 import pymupdf as fitz
 from fastapi import FastAPI, File, Form, Header, HTTPException, Request, UploadFile
@@ -42,7 +43,8 @@ SERVE_UI = os.environ.get("SERVE_UI", "1") == "1"            # the test page at 
 # --------------------------------------------------------------------------- #
 class JsonFormatter(logging.Formatter):
     def format(self, record):
-        entry = {"severity": record.levelname, "message": record.getMessage(), **getattr(record, "fields", {})}
+        entry = {"time": datetime.fromtimestamp(record.created, timezone.utc).isoformat(timespec="milliseconds"),
+                 "severity": record.levelname, "message": record.getMessage(), **getattr(record, "fields", {})}
         if record.exc_info:
             entry["stack_trace"] = self.formatException(record.exc_info)
         return json.dumps(entry, default=str)
@@ -59,6 +61,7 @@ app = FastAPI(title="PDF Edit API (simple)", version="1.0.0")
 
 
 def error_body(code, message, request):
+    request.state.error = code          # the request log line shows which error it was
     return {"error": {"code": code, "message": message, "requestId": getattr(request.state, "rid", None)}}
 
 
@@ -76,9 +79,14 @@ async def request_log(request: Request, call_next):
             "INTERNAL_ERROR", "Something went wrong while processing this PDF. Please try again.", request))
     response.headers["X-Request-Id"] = rid
     if request.url.path != "/healthz":
-        log.info(f"{request.method} {request.url.path} {response.status_code}", extra={"fields": {
+        status = response.status_code
+        # ERROR = our fault (5xx), WARNING = the request was refused (4xx), INFO = success
+        level = logging.ERROR if status >= 500 else logging.WARNING if status >= 400 else logging.INFO
+        error = getattr(request.state, "error", None)
+        log.log(level, f"{request.method} {request.url.path} {status}" + (f" {error}" if error else ""), extra={"fields": {
             "requestId": rid, "method": request.method, "path": request.url.path,
-            "status": response.status_code, "ms": round((time.perf_counter() - start) * 1000),
+            "status": status, **({"error": error} if error else {}),
+            "ms": round((time.perf_counter() - start) * 1000),
             "bytesIn": int(request.headers.get("content-length") or 0), **request.state.log}})
     return response
 
