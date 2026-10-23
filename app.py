@@ -265,7 +265,7 @@ async def edit(request: Request, file: UploadFile = File(...), changes: str = Fo
         "X-Edit-Warnings": json.dumps(warnings)})
 
 
-@app.get("/healthz", include_in_schema=False)
+@app.api_route("/healthz", methods=["GET", "HEAD"], include_in_schema=False)  # uptime monitors often use HEAD
 def healthz():
     return {"ok": True}
 
