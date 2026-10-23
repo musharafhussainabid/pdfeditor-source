@@ -14,7 +14,8 @@
     --radius:10px;
   }
   *{box-sizing:border-box}
-  html,body{height:100%}
+  html{height:100%}
+  body{min-height:100%}   /* not height:100%: that ends the sticky toolbars after one screen */
   body{margin:0;font:15px/1.5 "Segoe UI",system-ui,-apple-system,Roboto,sans-serif;background:var(--bg);color:var(--ink);
        -webkit-font-smoothing:antialiased}
   button{font:inherit;color:inherit}
@@ -540,9 +541,14 @@ const ICON = {
 
 function clearAdded() { added.forEach(a => a.url && URL.revokeObjectURL(a.url)); added = []; }
 
+// Top of the document area on screen: below the toolbars (never above the window).
+function viewTop() {
+  return Math.max(0, $(".bar").getBoundingClientRect().bottom, $("#fmt").hidden ? 0 : $("#fmt").getBoundingClientRect().bottom);
+}
+
 // The page most visible on screen, and the vertical middle of its visible part (in points).
 function visibleSpot() {
-  const els = [...document.querySelectorAll(".page")], top = ($("#fmt").hidden ? $(".bar") : $("#fmt")).getBoundingClientRect().bottom;
+  const els = [...document.querySelectorAll(".page")], top = viewTop();
   let best = 0, bestArea = -Infinity;
   els.forEach((el, i) => { const r = el.getBoundingClientRect(), a = Math.min(r.bottom, innerHeight) - Math.max(r.top, top); if (a > bestArea) { bestArea = a; best = i; } });
   const r = els[best].getBoundingClientRect(), Z = zoom * PT;
@@ -659,11 +665,37 @@ function startDrag(e, a, box, mode) {
   select(a.id);
   const Z = zoom * PT, page = doc.pages[a.page], sx = e.clientX, sy = e.clientY, r0 = [...a.rect];
   const w0 = r0[2] - r0[0], h0 = r0[3] - r0[1], ratio = w0 / h0;
+  // Moving: the item follows the pointer onto whichever page it is over (pages turned sideways
+  // can't take additions, so they are skipped), and the window scrolls near its top/bottom edge.
+  const pageEls = [...document.querySelectorAll(".page")];
+  const grab = box.getBoundingClientRect(), ox = sx - grab.left, oy = sy - grab.top;
+  let last = { clientX: sx, clientY: sy }, scrollTimer = null;
+  const moveTo = ev => {
+    let best = null, bestD = Infinity;
+    pageEls.forEach((el, i) => {
+      if (doc.pages[i].rotated) return;
+      const r = el.getBoundingClientRect(), d = ev.clientY < r.top ? r.top - ev.clientY : ev.clientY > r.bottom ? ev.clientY - r.bottom : 0;
+      if (d < bestD) { bestD = d; best = i; }
+    });
+    if (best === null) return;
+    const p = doc.pages[best], r = pageEls[best].getBoundingClientRect();
+    const x0 = clamp((ev.clientX - ox - r.left) / Z, 0, p.width - w0), y0 = clamp((ev.clientY - oy - r.top) / Z, 0, p.height - h0);
+    if (best !== a.page) { a.page = best; pageEls[best].appendChild(box); }
+    a.rect = [x0, y0, x0 + w0, y0 + h0];
+  };
+  const autoScroll = () => {
+    const edge = 70, top = viewTop();
+    const v = last.clientY < top + edge ? -Math.ceil((top + edge - last.clientY) / 4)
+            : last.clientY > innerHeight - edge ? Math.ceil((last.clientY - innerHeight + edge) / 4) : 0;
+    if (v) { scrollBy(0, v); moveTo(last); position(box, a, Z); }
+    scrollTimer = requestAnimationFrame(autoScroll);
+  };
   const move = ev => {
     const dx = (ev.clientX - sx) / Z, dy = (ev.clientY - sy) / Z;
     if (mode === "move") {
-      const x0 = clamp(r0[0] + dx, 0, page.width - w0), y0 = clamp(r0[1] + dy, 0, page.height - h0);
-      a.rect = [x0, y0, x0 + w0, y0 + h0];
+      last = { clientX: ev.clientX, clientY: ev.clientY };
+      moveTo(last);
+      if (!scrollTimer) scrollTimer = requestAnimationFrame(autoScroll);
     } else if (a.type === "text") {
       a.rect = [r0[0], r0[1], r0[0] + clamp(w0 + dx, 30, page.width - r0[0]), r0[3]];
     } else {
@@ -674,8 +706,12 @@ function startDrag(e, a, box, mode) {
     position(box, a, Z);
     if (a.type === "text") box._sync();
   };
-  const up = () => { removeEventListener("pointermove", move); removeEventListener("pointerup", up); refresh(); };
-  addEventListener("pointermove", move); addEventListener("pointerup", up);
+  const up = () => {
+    cancelAnimationFrame(scrollTimer);
+    removeEventListener("pointermove", move); removeEventListener("pointerup", up); removeEventListener("pointercancel", up);
+    refresh();
+  };
+  addEventListener("pointermove", move); addEventListener("pointerup", up); addEventListener("pointercancel", up);
 }
 
 document.addEventListener("pointerdown", e => { if (selectedId && !e.target.closest(".addn, .addgroup, .fmt, dialog")) select(null); });
