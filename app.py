@@ -7,7 +7,6 @@ PDF Edit API (simple version): no login, no storage, nothing kept between calls.
 
     uvicorn app:app --port 8080        then open http://localhost:8080
 """
-import base64
 import hmac
 import json
 import logging
@@ -27,14 +26,80 @@ from starlette.concurrency import run_in_threadpool
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 import edit_doc
+import asyncio
+import multiprocessing
+from contextlib import asynccontextmanager
+from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 
 MAX_MB = float(os.environ.get("MAX_FILE_MB", "30"))       # Cloud Run accepts up to 32 MiB per request
 MAX_PAGES = int(os.environ.get("MAX_PAGES", "200"))
 PREVIEW_PAGES = int(os.environ.get("PREVIEW_PAGES", "20"))
 API_KEY = os.environ.get("API_KEY", "")                   # optional: if set, callers must send X-Api-Key
 ALLOWED_ORIGINS = os.environ.get("ALLOWED_ORIGINS", "*")
-RATE_LIMIT = int(os.environ.get("RATE_LIMIT_PER_MIN", "0"))  # per client IP and worker; 0 = off
+RATE_LIMIT = int(os.environ.get("RATE_LIMIT_PER_MIN", "0"))  # per client IP (per web process); 0 = off
 SERVE_UI = os.environ.get("SERVE_UI", "1") == "1"            # the test page at "/"
+# PDFs processed at the same time. Above 1, jobs go to that many engine processes through one
+# shared queue: a free engine always takes the next job, and a crash only replaces that engine.
+ENGINES = max(1, int(os.environ.get("WORKERS", "1")))
+
+_pool = None
+
+
+JOB_TIMEOUT = 110          # seconds; answer before the proxy in front gives up (120 s)
+
+
+def engine_pool():
+    global _pool
+    if _pool is None:
+        _pool = ProcessPoolExecutor(max_workers=ENGINES, mp_context=multiprocessing.get_context("spawn"))
+    return _pool
+
+
+def engines_alive():
+    """False when the pool exists but has lost all its engine processes."""
+    if ENGINES == 1 or _pool is None:
+        return True
+    procs = getattr(_pool, "_processes", None) or {}
+    return any(p.is_alive() for p in procs.values())
+
+
+def _reset_pool(reason):
+    global _pool
+    log.error(f"{reason}; restarting the PDF engines")
+    old, _pool = _pool, None
+    if old is not None:
+        for p in (getattr(old, "_processes", None) or {}).values():
+            p.kill()
+        old.shutdown(wait=False, cancel_futures=True)
+
+
+class RequestError(Exception):
+    """A refused request, raised inside an engine and turned into an HTTP error by the web process."""
+    def __init__(self, status, detail):
+        super().__init__(detail)
+        self.status, self.detail = status, detail
+
+    def __reduce__(self):
+        return (RequestError, (self.status, self.detail))
+
+
+async def engine(fn, *args):
+    """Run PDF work off the web process: in a thread for a single engine, else in the engine pool."""
+    try:
+        if ENGINES == 1:
+            return await run_in_threadpool(fn, *args)
+        fut = asyncio.get_running_loop().run_in_executor(engine_pool(), fn, *args)
+        return await asyncio.wait_for(fut, JOB_TIMEOUT)
+    except RequestError as exc:
+        raise HTTPException(exc.status, exc.detail)
+    except BrokenProcessPool:
+        _reset_pool("An engine process crashed")           # e.g. inside the PDF library
+        raise
+    except asyncio.TimeoutError:
+        if not engines_alive():
+            _reset_pool("No engine processes left")
+        raise HTTPException(503, "The editor is very busy. Please try again in a moment.")
 
 
 # --------------------------------------------------------------------------- #
@@ -57,7 +122,18 @@ log.addHandler(_handler)
 log.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
 log.propagate = False
 
-app = FastAPI(title="PDF Edit API (simple)", version="1.0.0")
+@asynccontextmanager
+async def lifespan(_app):
+    if ENGINES > 1:          # start every engine now, so the first users don't wait for it
+        loop = asyncio.get_running_loop()
+        await asyncio.gather(*(loop.run_in_executor(engine_pool(), edit_doc.warm_up) for _ in range(ENGINES)))
+        log.info(f"{ENGINES} PDF engines ready")
+    yield
+    if _pool is not None:
+        _pool.shutdown(wait=False, cancel_futures=True)
+
+
+app = FastAPI(title="PDF Edit API (simple)", version="1.0.0", lifespan=lifespan)
 
 
 def error_body(code, message, request):
@@ -131,10 +207,21 @@ async def read_pdf(file):
 
 
 def analysis(data):
+    """The engine's analysis (runs in an engine process)."""
     try:
         return edit_doc.analyze(data, max_pages=MAX_PAGES)
     except edit_doc.PdfRejected as exc:
-        raise HTTPException(422, {"code": exc.code, "message": str(exc)})
+        raise RequestError(422, {"code": exc.code, "message": str(exc)})
+
+
+def analyze_job(data, previews):
+    """Everything /analyze does with the PDF, in one engine call: returns the JSON body and page count."""
+    _info, layout = analysis(data)
+    if previews:
+        pages = layout["pages"][:PREVIEW_PAGES]
+        for page, url in zip(pages, edit_doc.page_previews(data, [p["index"] for p in pages])):
+            page["preview"] = url
+    return json.dumps(layout, separators=(",", ":")).encode(), len(layout["pages"])
 
 
 @app.post("/analyze")
@@ -144,19 +231,9 @@ async def analyze(request: Request, file: UploadFile = File(...), previews: bool
     check_key(x_api_key)
     check_rate(request)
     data = await read_pdf(file)
-    # PDF work runs in a thread so this worker keeps answering health checks meanwhile
-    _info, layout = await run_in_threadpool(analysis, data)
-    request.state.log = {"pages": len(layout["pages"]), "previews": previews}
-    if previews:
-        await run_in_threadpool(add_previews, data, layout)
-    return layout
-
-
-def add_previews(data, layout):
-    doc = fitz.open("pdf", data)
-    for page in layout["pages"][:PREVIEW_PAGES]:
-        pix = doc[page["index"]].get_pixmap(dpi=110)
-        page["preview"] = "data:image/jpeg;base64," + base64.b64encode(pix.tobytes("jpeg", jpg_quality=80)).decode()
+    body, pages = await engine(analyze_job, data, previews)
+    request.state.log = {"pages": pages, "previews": previews}
+    return Response(body, media_type="application/json")
 
 
 MAX_ADDITIONS = 50
@@ -280,13 +357,31 @@ async def edit(request: Request, file: UploadFile = File(...), changes: str = Fo
     check_key(x_api_key)
     check_rate(request)
     data = await read_pdf(file)
+    files = await read_images(images)
+    out, warnings, counts = await engine(edit_job, data, changes, files)
+    request.state.log = {**counts, "warnings": len(warnings), "bytesOut": len(out)}
+    name = (file.filename or "document.pdf").rsplit(".", 1)[0]
+    return Response(out, media_type="application/pdf", headers={
+        "Content-Disposition": f'attachment; filename="{re.sub(r"[^A-Za-z0-9 ._-]", "_", name)} (edited).pdf"',
+        "X-Edit-Warnings": json.dumps(warnings)})
+
+
+def edit_job(data, changes, files):
+    """Everything /edit does with the PDF, in one engine call: check the changes, apply them."""
+    try:
+        return _edit(data, changes, files)
+    except HTTPException as exc:          # a refused request: carry it back to the web process
+        raise RequestError(exc.status_code, exc.detail)
+
+
+def _edit(data, changes, files):
     try:
         body = json.loads(changes)
     except ValueError:
         raise HTTPException(400, "'changes' must be JSON.")
     if not isinstance(body, dict):
         raise HTTPException(400, "'changes' must be a JSON object.")
-    info, _layout = await run_in_threadpool(analysis, data)   # same PDF -> same analysis -> the ids from /analyze match
+    info, _layout = analysis(data)   # same PDF -> same analysis -> the ids from /analyze match
     edits, inserts = [], []
     pages = info["pages"]
     for e in body.get("edits") or []:
@@ -306,24 +401,19 @@ async def edit(request: Request, file: UploadFile = File(...), changes: str = Fo
         if not isinstance(items, list) or not all(isinstance(s, str) for s in items):
             raise HTTPException(400, f"'items' for {ins.get('listId')} must be a list of strings.")
         inserts.append({"page": int(m[1]), "list": int(m[2]), "after": k, "items": items})
-    files = await read_images(images)
     additions = read_additions(body.get("additions") or [], files, pages)
     objects, erase = read_objects(body.get("objects") or [], body.get("erase") or [], files, pages)
     if not edits and not inserts and not additions and not objects and not erase:
         raise HTTPException(400, "No changes given.")
-    out, page_count, warnings = await run_in_threadpool(
-        edit_doc.apply_changes, data, info, edits, inserts, additions, objects, erase)
-    request.state.log = {"pages": page_count, "edits": len(edits), "inserts": len(inserts),
-                         "additions": len(additions), "objects": len(objects), "erase": len(erase),
-                         "warnings": len(warnings), "bytesOut": len(out)}
-    name = (file.filename or "document.pdf").rsplit(".", 1)[0]
-    return Response(out, media_type="application/pdf", headers={
-        "Content-Disposition": f'attachment; filename="{re.sub(r"[^A-Za-z0-9 ._-]", "_", name)} (edited).pdf"',
-        "X-Edit-Warnings": json.dumps(warnings)})
+    out, page_count, warnings = edit_doc.apply_changes(data, info, edits, inserts, additions, objects, erase)
+    return out, warnings, {"pages": page_count, "edits": len(edits), "inserts": len(inserts),
+                           "additions": len(additions), "objects": len(objects), "erase": len(erase)}
 
 
 @app.api_route("/healthz", methods=["GET", "HEAD"], include_in_schema=False)  # uptime monitors often use HEAD
 def healthz():
+    if not engines_alive():
+        return JSONResponse({"ok": False, "reason": "no PDF engines"}, status_code=503)
     return {"ok": True}
 
 
@@ -338,7 +428,7 @@ def index():
 # Every error has the same shape: {"error": {"code", "message", "requestId"}}
 # --------------------------------------------------------------------------- #
 ERROR_CODES = {400: "BAD_REQUEST", 401: "UNAUTHORIZED", 404: "NOT_FOUND", 405: "METHOD_NOT_ALLOWED",
-               413: "FILE_TOO_LARGE", 422: "PDF_REJECTED", 429: "RATE_LIMITED"}
+               413: "FILE_TOO_LARGE", 422: "PDF_REJECTED", 429: "RATE_LIMITED", 503: "BUSY"}
 
 
 @app.exception_handler(StarletteHTTPException)

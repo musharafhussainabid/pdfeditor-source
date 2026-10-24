@@ -53,8 +53,8 @@ docker run -p 8080:8080 pdf-editor
 | `API_KEY` | empty | If set, callers must send it in the `X-Api-Key` header |
 | `ALLOWED_ORIGINS` | `*` | Websites allowed to call the API (CORS), comma-separated |
 | `MAX_FILE_MB` / `MAX_PAGES` | `30` / `200` | Limits |
-| `WORKERS` | `1` | Parallel worker processes |
-| `RATE_LIMIT_PER_MIN` | `0` (off) | Requests per minute per client IP, per worker |
+| `WORKERS` | `1` | PDFs processed at the same time (engine processes) |
+| `RATE_LIMIT_PER_MIN` | `0` (off) | Requests per minute per client IP |
 | `SERVE_UI` | `1` | `0` hides the test page |
 
 ## Licence

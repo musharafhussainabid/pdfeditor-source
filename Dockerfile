@@ -16,7 +16,8 @@ USER app
 ENV PYTHONUNBUFFERED=1 PORT=8080 AWS_LWA_PORT=8080 AWS_LWA_READINESS_CHECK_PATH=/healthz
 EXPOSE 8080
 # app.py logs every request as JSON, so uvicorn's own access log is off.
-# WORKERS: parallel processes (1 on Lambda/Cloud Run; about cores - 2 on a VPS).
+# WORKERS: PDFs processed at the same time, by that many engine processes behind one web
+# process (1 on Lambda/Cloud Run; about the number of cores on a VPS).
 # FORWARDED_ALLOW_IPS: trust the proxy in front (Caddy) to pass on the user's real IP.
 ENV WORKERS=1 FORWARDED_ALLOW_IPS=127.0.0.1
-CMD ["sh", "-c", "exec uvicorn app:app --host 0.0.0.0 --port 8080 --no-access-log --workers \"$WORKERS\" --proxy-headers --forwarded-allow-ips \"$FORWARDED_ALLOW_IPS\" --timeout-keep-alive 30"]
+CMD ["sh", "-c", "exec uvicorn app:app --host 0.0.0.0 --port 8080 --no-access-log --proxy-headers --forwarded-allow-ips \"$FORWARDED_ALLOW_IPS\" --timeout-keep-alive 30"]

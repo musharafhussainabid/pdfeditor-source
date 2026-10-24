@@ -2726,6 +2726,27 @@ class PdfRejected(Exception):
         super().__init__(message)
         self.code = code
 
+    def __reduce__(self):            # so it survives the trip back from an engine process
+        return (PdfRejected, (self.code, str(self)))
+
+
+def page_previews(pdf_bytes, indexes, dpi=110):
+    """JPEG data URLs of the given pages, for display."""
+    import base64
+    doc = fitz.open("pdf", pdf_bytes)
+    out = []
+    for i in indexes:
+        pix = doc[i].get_pixmap(dpi=dpi)
+        out.append("data:image/jpeg;base64," + base64.b64encode(pix.tobytes("jpeg", jpg_quality=80)).decode())
+    doc.close()
+    return out
+
+
+def warm_up():
+    """Run once in each engine process at start-up, so the first real request isn't slower."""
+    system_fonts()
+    return True
+
 
 def analyze(pdf_bytes, max_pages=None):
     """Extract editable lines and lists. Returns (info, layout)."""
