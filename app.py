@@ -161,14 +161,13 @@ def add_previews(data, layout):
 
 MAX_ADDITIONS = 50
 MAX_IMAGE_MB = 10
+MAX_OBJECTS = 200          # existing images changed in one save
+MAX_ERASE = 50
 HEX_COLOR = re.compile(r"#[0-9a-fA-F]{6}")
 
 
-async def read_additions(raw, images, pages):
-    """Check the "additions" list and attach each image's bytes.
-    Images arrive as extra 'images' files; an addition's imageId is that file's name."""
-    if not isinstance(raw, list) or len(raw) > MAX_ADDITIONS:
-        raise HTTPException(400, f"'additions' must be a list of up to {MAX_ADDITIONS} items.")
+async def read_images(images):
+    """The uploaded 'images' files by file name (the imageId additions and replacements use)."""
     files = {}
     for f in images or []:
         blob = await f.read()
@@ -177,6 +176,58 @@ async def read_additions(raw, images, pages):
         if not (blob.startswith(b"\x89PNG\r\n\x1a\n") or blob.startswith(b"\xff\xd8\xff")):
             raise HTTPException(400, f"Image {f.filename!r} must be a PNG or JPEG.")
         files[f.filename] = blob
+    return files
+
+
+def _rect(rect):
+    return (isinstance(rect, list) and len(rect) == 4 and all(isinstance(v, (int, float)) for v in rect)
+            and rect[2] > rect[0] and rect[3] > rect[1])
+
+
+def read_objects(raw, raw_erase, files, pages):
+    """Check "objects" (existing images to remove / move / replace) and "erase" (areas to clear)."""
+    if not isinstance(raw, list) or len(raw) > MAX_OBJECTS:
+        raise HTTPException(400, f"'objects' must be a list of up to {MAX_OBJECTS} items.")
+    if not isinstance(raw_erase, list) or len(raw_erase) > MAX_ERASE:
+        raise HTTPException(400, f"'erase' must be a list of up to {MAX_ERASE} items.")
+    objects, seen = [], set()
+    for n, o in enumerate(raw):
+        o = o if isinstance(o, dict) else {}
+        m = re.fullmatch(r"p(\d+)-i(\d+)", str(o.get("id", "")))
+        if not m or int(m[1]) >= len(pages) or int(m[2]) >= len(pages[int(m[1])]["images"]):
+            raise HTTPException(400, f"objects[{n}]: unknown image id {o.get('id')!r}.")
+        if o["id"] in seen:
+            raise HTTPException(400, f"objects[{n}]: image {o['id']} is listed twice.")
+        seen.add(o["id"])
+        action = o.get("action")
+        item = {"page": int(m[1]), "index": int(m[2]), "action": action, "allPages": bool(o.get("allPages"))}
+        if action not in ("remove", "move", "replace"):
+            raise HTTPException(400, f"objects[{n}]: action must be remove, move or replace.")
+        if action in ("move", "replace") and ("page" in o or "rect" in o):
+            to = o.get("page", item["page"])
+            if not isinstance(to, int) or not 0 <= to < len(pages) or not _rect(o.get("rect")):
+                raise HTTPException(400, f"objects[{n}]: {action} needs a valid page and rect [x0, y0, x1, y1].")
+            item.update(to_page=to, rect=[float(v) for v in o["rect"]])
+        elif action == "move":
+            raise HTTPException(400, f"objects[{n}]: move needs page and rect.")
+        if action == "replace":
+            if o.get("imageId") not in files:
+                raise HTTPException(400, f"objects[{n}]: no uploaded image named {o.get('imageId')!r}.")
+            item["image"] = files[o["imageId"]]
+        objects.append(item)
+    erase = []
+    for n, e in enumerate(raw_erase):
+        e = e if isinstance(e, dict) else {}
+        if not isinstance(e.get("page"), int) or not 0 <= e["page"] < len(pages) or not _rect(e.get("rect")):
+            raise HTTPException(400, f"erase[{n}]: needs a valid page and rect [x0, y0, x1, y1].")
+        erase.append({"page": e["page"], "rect": [float(v) for v in e["rect"]], "text": bool(e.get("text"))})
+    return objects, erase
+
+
+def read_additions(raw, files, pages):
+    """Check the "additions" list and attach each image's bytes (an addition's imageId is a file name)."""
+    if not isinstance(raw, list) or len(raw) > MAX_ADDITIONS:
+        raise HTTPException(400, f"'additions' must be a list of up to {MAX_ADDITIONS} items.")
     out = []
     for n, a in enumerate(raw):
         a = a if isinstance(a, dict) else {}
@@ -221,9 +272,11 @@ async def edit(request: Request, file: UploadFile = File(...), changes: str = Fo
                images: list[UploadFile] = File(default=[]), x_api_key: str = Header(default="")):
     """Apply changes to the PDF and return the edited file.
     changes = {"edits": [{"lineId", "text"}], "inserts": [{"listId", "afterItem", "items"}],
-               "additions": [{"type": "text"|"image"|"signature", "page", "rect", ...}]}
+               "additions": [{"type": "text"|"image"|"signature", "page", "rect", ...}],
+               "objects": [{"id": "p0-i2", "action": "remove"|"move"|"replace", "allPages", "page", "rect", "imageId"}],
+               "erase": [{"page", "rect", "text": false}]}
     A text addition with "font": "doc" and "fontFrom": "<lineId>" is written in that line's own font.
-    images  = the PNG/JPEG files that image and signature additions point to (by file name)."""
+    images  = the PNG/JPEG files that additions and replacements point to (by file name)."""
     check_key(x_api_key)
     check_rate(request)
     data = await read_pdf(file)
@@ -253,12 +306,16 @@ async def edit(request: Request, file: UploadFile = File(...), changes: str = Fo
         if not isinstance(items, list) or not all(isinstance(s, str) for s in items):
             raise HTTPException(400, f"'items' for {ins.get('listId')} must be a list of strings.")
         inserts.append({"page": int(m[1]), "list": int(m[2]), "after": k, "items": items})
-    additions = await read_additions(body.get("additions") or [], images, pages)
-    if not edits and not inserts and not additions:
+    files = await read_images(images)
+    additions = read_additions(body.get("additions") or [], files, pages)
+    objects, erase = read_objects(body.get("objects") or [], body.get("erase") or [], files, pages)
+    if not edits and not inserts and not additions and not objects and not erase:
         raise HTTPException(400, "No changes given.")
-    out, page_count, warnings = await run_in_threadpool(edit_doc.apply_changes, data, info, edits, inserts, additions)
+    out, page_count, warnings = await run_in_threadpool(
+        edit_doc.apply_changes, data, info, edits, inserts, additions, objects, erase)
     request.state.log = {"pages": page_count, "edits": len(edits), "inserts": len(inserts),
-                         "additions": len(additions), "warnings": len(warnings), "bytesOut": len(out)}
+                         "additions": len(additions), "objects": len(objects), "erase": len(erase),
+                         "warnings": len(warnings), "bytesOut": len(out)}
     name = (file.filename or "document.pdf").rsplit(".", 1)[0]
     return Response(out, media_type="application/pdf", headers={
         "Content-Disposition": f'attachment; filename="{re.sub(r"[^A-Za-z0-9 ._-]", "_", name)} (edited).pdf"',

@@ -2503,17 +2503,176 @@ def is_digitally_signed(doc):
         return False
 
 
-def apply_changes(pdf_bytes, info, edits, inserts, additions=()):
+# --------------------------------------------------------------------------- #
+# Existing images (remove / move / replace) and erased areas
+# --------------------------------------------------------------------------- #
+def page_images(page):
+    """Images drawn on a page, in drawing order: [{"bbox", "xref", "full"}]; an image's id is its index.
+    "full" = it covers most of the page (a scan or a background), so it isn't offered for clicking.
+    Pages turned sideways get none, like the rest of their editing."""
+    if page.rotation:
+        return []
+    area, out = page.rect.get_area(), []
+    for im in page.get_image_info(xrefs=True):
+        r = fitz.Rect(im["bbox"]) & page.rect
+        if r.is_empty or r.width < 3 or r.height < 3:
+            continue
+        out.append({"bbox": r2(r), "xref": int(im.get("xref") or 0), "full": r.get_area() >= 0.85 * area})
+    return out
+
+
+def image_stream(doc, xref):
+    """The picture of an image object as bytes insert_image accepts, keeping its transparency."""
+    try:
+        meta = doc.extract_image(xref) or {}
+    except Exception:
+        meta = {}
+    if meta.get("image") and not meta.get("smask") and meta.get("ext") in ("png", "jpeg", "jpg"):
+        return meta["image"]                       # the original file: no quality loss
+    pix = fitz.Pixmap(doc, xref)
+    if meta.get("smask"):
+        try:
+            pix = fitz.Pixmap(pix, fitz.Pixmap(doc, meta["smask"]))
+        except Exception:
+            pass                                   # mask of another size: keep the picture without it
+    if pix.colorspace and pix.colorspace.n > 3:     # CMYK -> RGB for PNG
+        pix = fitz.Pixmap(fitz.csRGB, pix)
+    return pix.tobytes("png")
+
+
+def apply_objects(doc, info, objects, erase, warnings):
+    """Remove existing images and erase areas, before any other change.
+      objects: [{"page", "index", "action": "remove"|"move"|"replace", "allPages",
+                 "to_page", "rect" (new place, move/replace), "image" (bytes, replace)}]
+      erase:   [{"page", "rect", "text": also remove text}]
+    An image is removed for real, not covered. When every copy of a picture goes, the picture
+    itself is blanked (exact, whatever lies around it); a single copy is cut out with a redaction,
+    which is refused if another image overlaps it (the redaction would take that one too).
+    Returns the pictures to draw once every other change is done: [(page, rect, ("xref"|"bytes", v))]."""
+    pages = info["pages"]
+    copies = {}
+    for p, pg in enumerate(pages):
+        for k, im in enumerate(pg.get("images", [])):
+            if im["xref"]:
+                copies.setdefault(im["xref"], []).append((p, k))
+
+    # 1. which copies each change removes
+    plans = []
+    for o in objects:
+        p, k = o["page"], o["index"]
+        im = pages[p]["images"][k]
+        if o["action"] == "move" and not im["xref"]:
+            warnings.append(f"Page {p + 1}: this image is stored in a way that can't be moved, so it was left in place.")
+            continue
+        group = copies[im["xref"]] if (o.get("allPages") and im["xref"]) else [(p, k)]
+        plans.append((o, group))
+    targets = {t for _, group in plans for t in group}
+    blank = {x for x, where in copies.items() if all(t in targets for t in where)}
+
+    # 2. copies cut out one by one must not overlap another image
+    blocked = set()
+    for (p, k) in targets:
+        im = pages[p]["images"][k]
+        if im["xref"] in blank:
+            continue
+        r = fitz.Rect(im["bbox"]) + (1, 1, -1, -1)
+        for j, other in enumerate(pages[p]["images"]):
+            if j != k and (p, j) not in targets and other["xref"] not in blank and (fitz.Rect(other["bbox"]) & r).get_area() > 0:
+                blocked.add((p, k))
+                break
+    done = []
+    for o, group in plans:
+        if any(t in blocked for t in group):
+            warnings.append(f"Page {o['page'] + 1}: an image overlaps another picture, so it couldn't be changed on its own "
+                            "and was left in place." + (" Try “all pages”, or Erase area." if len(group) == 1 else ""))
+            targets -= set(group)
+        else:
+            done.append((o, group))
+    blank = {x for x, where in copies.items() if all(t in targets for t in where)}
+
+    # 3. what to draw afterwards (pictures that are about to be blanked are copied out first)
+    streams = {}
+    def source(xref):
+        if xref not in blank:
+            return ("xref", xref)
+        if xref not in streams:
+            streams[xref] = image_stream(doc, xref)
+        return ("bytes", streams[xref])
+    placements = []
+    for o, group in done:
+        p, k = o["page"], o["index"]
+        im = pages[p]["images"][k]
+        if o["action"] == "move":
+            placements.append((o["to_page"], o["rect"], source(im["xref"])))
+        elif o["action"] == "replace":
+            if len(group) > 1:
+                placements += [(q, pages[q]["images"][j]["bbox"], ("bytes", o["image"])) for q, j in group]
+            else:
+                placements.append((o.get("to_page", p), o.get("rect") or im["bbox"], ("bytes", o["image"])))
+
+    # 4. remove
+    for xref in blank:
+        p = copies[xref][0][0]
+        doc[p].delete_image(xref)
+    by_page = {}
+    for (p, k) in targets:
+        if pages[p]["images"][k]["xref"] not in blank:
+            by_page.setdefault(p, []).append(fitz.Rect(pages[p]["images"][k]["bbox"]) + (1, 1, -1, -1))
+    for p, rects in by_page.items():
+        page = doc[p]
+        for r in rects:
+            page.add_redact_annot(r, fill=False, cross_out=False)
+        page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_REMOVE, graphics=fitz.PDF_REDACT_LINE_ART_NONE,
+                              text=fitz.PDF_REDACT_TEXT_NONE)
+
+    # 5. erase areas: drawings fully inside go, images are blanked inside, text only if asked
+    for e in erase:
+        page = doc[e["page"]]
+        if page.rotation:
+            warnings.append(f"Page {e['page'] + 1} is turned sideways, so the area to erase on it was skipped.")
+            continue
+        r = fitz.Rect(e["rect"]) & page.rect
+        if r.is_empty:
+            continue
+        page.add_redact_annot(r, fill=False, cross_out=False)
+        page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_PIXELS, graphics=fitz.PDF_REDACT_LINE_ART_REMOVE_IF_COVERED,
+                              text=fitz.PDF_REDACT_TEXT_REMOVE if e.get("text") else fitz.PDF_REDACT_TEXT_NONE)
+    return placements
+
+
+def place_pictures(doc, placements, warnings):
+    """Draw moved and replacement images (after every other change, under the additions)."""
+    for p, rect, (kind, value) in placements:
+        page = doc[p]
+        if page.rotation:
+            warnings.append(f"Page {p + 1} is turned sideways, so an image moved or replaced on it was skipped.")
+            continue
+        r = fitz.Rect(rect) & page.rect
+        if r.is_empty or r.width < 2 or r.height < 2:
+            continue
+        try:
+            if kind == "xref":
+                page.insert_image(r, xref=value, keep_proportion=True)
+            else:
+                page.insert_image(r, stream=value, keep_proportion=True)
+        except Exception:
+            warnings.append(f"Page {p + 1}: an image couldn't be placed, so it was skipped.")
+
+
+def apply_changes(pdf_bytes, info, edits, inserts, additions=(), objects=(), erase=()):
     """
-    Apply text edits and list insertions to the original PDF, then place additions on top.
+    Remove/move/replace existing images and erase areas, apply text edits and list insertions,
+    then place additions on top.
       edits:     [{"page", "line", "text"}]            (text may contain "\n" line breaks)
       inserts:   [{"page", "list", "after", "items"}]   (items: strings; "-" lines are sub-points)
-      additions: see apply_additions
+      additions: see apply_additions;  objects, erase: see apply_objects
     Returns (edited_pdf_bytes, page_count, warnings).
     """
     info = json.loads(json.dumps(info))  # never mutate the stored analysis
     doc = fitz.open("pdf", pdf_bytes)
     fc, warnings = new_font_context(), []
+    # first, while everything is where /analyze saw it
+    pictures = apply_objects(doc, info, objects, erase, warnings) if (objects or erase) else []
     info["_by_xref"] = {doc.page_xref(i): info["pages"][i] for i in range(doc.page_count)}
     info["_inserts"] = []
 
@@ -2553,6 +2712,7 @@ def apply_changes(pdf_bytes, info, edits, inserts, additions=()):
                         and abs(it["row_bottom0"] - ins["_item"]["row_bottom0"]) < 0.5:
                     it["row_bottom"] += moved
 
+    place_pictures(doc, pictures, warnings)
     apply_additions(doc, info, additions, fc, warnings)
     out = doc.tobytes(garbage=4, deflate=True)
     pages = doc.page_count
@@ -2579,21 +2739,27 @@ def analyze(pdf_bytes, max_pages=None):
         raise PdfRejected("PDF_TOO_MANY_PAGES", f"The PDF has more than {max_pages} pages.")
     all_lines = [extract_lines(page) for page in doc]
     bands = page_bands(doc, all_lines)
+    all_images = [page_images(page) for page in doc]
+    copies = {}
+    for imgs in all_images:
+        for im in imgs:
+            if im["xref"]:
+                copies[im["xref"]] = copies.get(im["xref"], 0) + 1
     pages, layout_pages = [], []
     for pno, (page, lines, band) in enumerate(zip(doc, all_lines, bands)):
         column_rights(page, lines)
         lists = detect_lists(page, lines) if lines else []
         for l in lines:
             l.pop("_marker", None)
-        pages.append({"lines": lines, "lists": lists, **band})
-        layout_pages.append(_public_page(pno, page, lines, lists))
+        pages.append({"lines": lines, "lists": lists, "images": all_images[pno], **band})
+        layout_pages.append(_public_page(pno, page, lines, lists, all_images[pno], copies))
     has_text = any(all_lines)
     signed = is_digitally_signed(doc)
     doc.close()
     return {"pages": pages}, {"schemaVersion": 1, "hasText": has_text, "signed": signed, "pages": layout_pages}
 
 
-def _public_page(pno, page, lines, lists):
+def _public_page(pno, page, lines, lists, images=(), copies=None):
     """What the apps need to draw editing controls. Coordinates are PDF points,
     origin top-left of the page's visible area (multiply by zoom to get pixels)."""
     out_lines = []
@@ -2622,5 +2788,11 @@ def _public_page(pno, page, lines, lists):
                        "childListId": f"p{pno}-L{it['child_list']}" if it.get("child_list") is not None else None}
                       for k, it in enumerate(lst["items"])],
         })
+    copies = copies or {}
+    out_images = [{"id": f"p{pno}-i{k}", "bbox": im["bbox"], "full": im["full"],
+                   # the same picture drawn elsewhere too (a logo in every page header): "copies" > 1
+                   "copies": copies.get(im["xref"], 1) if im["xref"] else 1,
+                   "group": f"g{im['xref']}" if im["xref"] and copies.get(im["xref"], 1) > 1 else None}
+                  for k, im in enumerate(images)]
     return {"index": pno, "width": page.rect.width, "height": page.rect.height,
-            "rotated": bool(page.rotation), "lines": out_lines, "lists": out_lists}
+            "rotated": bool(page.rotation), "lines": out_lines, "lists": out_lists, "images": out_images}

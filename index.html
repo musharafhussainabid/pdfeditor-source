@@ -139,6 +139,34 @@
   .addn .h-del{top:-14px;right:-14px;background:var(--danger)}
   .addn .h-size{bottom:-14px;right:-14px;cursor:nwse-resize}
   .addn .h-move{top:-14px;left:-14px;cursor:move}
+
+  /* ---------- images already in the PDF, and erase areas ---------- */
+  .obj{position:absolute;cursor:pointer;border-radius:2px;outline:1.5px dashed transparent;outline-offset:1px}
+  .obj:hover{outline-color:rgba(59,91,219,.6);background:rgba(59,91,219,.06)}
+  .obj.sel{outline:1.5px solid var(--accent);background:rgba(59,91,219,.08);touch-action:none}
+  .btn[aria-pressed="true"]{background:var(--accent-soft);border-color:var(--accent);color:var(--accent)}
+  .obj.gone{background:repeating-linear-gradient(135deg,rgba(255,255,255,.9),rgba(255,255,255,.9) 5px,rgba(253,236,236,.9) 5px,rgba(253,236,236,.9) 10px);
+            outline:1.5px dashed var(--danger)}
+  .obj.gone::after{content:attr(data-label);position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);padding:1px 8px;border-radius:9px;
+                   background:var(--danger);color:#fff;font-size:11px;font-weight:600;white-space:nowrap}
+  .obj.gone.sel{outline-style:solid}
+  .objpic{width:100%;height:100%;background-repeat:no-repeat;pointer-events:none}
+  .objpic.none{display:grid;place-items:center;background:#eef1f6;color:var(--muted);font-size:11px}
+  .addn.erase{cursor:move;background:repeating-linear-gradient(135deg,rgba(255,255,255,.92),rgba(255,255,255,.92) 5px,rgba(253,236,236,.92) 5px,rgba(253,236,236,.92) 10px);
+              outline:1.5px dashed var(--danger)!important}
+  .addn.erase.sel{outline-style:solid!important}
+  .addn.erase::after{content:"Erase";position:absolute;left:4px;top:4px;padding:0 6px;border-radius:8px;background:var(--danger);color:#fff;font-size:10px;font-weight:700}
+  .page.erasing{cursor:crosshair}
+  .page.erasing .ln,.page.erasing .obj,.page.erasing .add{pointer-events:none}
+  .band{position:absolute;z-index:6;border:1.5px dashed var(--danger);background:rgba(240,68,56,.08);pointer-events:none}
+  .objbar{position:absolute;z-index:8;display:flex;align-items:center;gap:4px;padding:4px;border-radius:10px;background:#fff;
+          border:1px solid var(--line);box-shadow:0 8px 24px rgba(16,24,40,.16);white-space:nowrap}
+  .objbar button{height:30px;padding:0 10px;border:0;border-radius:7px;background:transparent;color:var(--ink);font:inherit;font-size:13px;
+                 font-weight:600;cursor:pointer;display:inline-flex;align-items:center;gap:6px}
+  .objbar button:hover{background:var(--soft,#f1f3f7)}
+  .objbar button.danger{color:var(--danger)}
+  .objbar label{display:inline-flex;align-items:center;gap:6px;padding:0 8px;font-size:13px;color:var(--muted);cursor:pointer}
+  .objbar .sep{width:1px;align-self:stretch;margin:4px 2px;background:var(--line)}
   .fmt{position:sticky;top:60px;z-index:19;display:flex;align-items:center;gap:6px;height:48px;padding:0 20px;background:var(--surface);
        border-bottom:1px solid var(--line);overflow-x:auto;scrollbar-width:none}
   .fmt-label{font-size:12px;font-weight:650;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;min-width:104px;white-space:nowrap}
@@ -183,6 +211,12 @@
     .welcome h1{font-size:24px}
     .hint{padding:8px 12px;gap:10px}
   }
+  @media (max-width:480px){
+    .bar{padding:0 10px;gap:6px}
+    .addgroup{gap:3px;padding-right:5px}
+    .addgroup .btn,#openAnother{padding:0 8px}
+    #save{padding:0 10px}
+  }
 </style>
 </head>
 <body>
@@ -212,8 +246,13 @@
         <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M2 11.5c1.5-3 3-6.5 4.2-6.5 1.5 0-1.7 6.5 0 6.5 1.2 0 1.8-2.5 3-2.5.9 0 .6 1.8 1.6 1.8.6 0 1.1-.6 1.7-1" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/><path d="M2 14h12" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>
         <span class="hide-md">Sign</span>
       </button>
+      <button class="btn" id="addErase" title="Erase an area: barcodes, drawings, stamps" aria-pressed="false">
+        <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="m9.5 2.8 3.7 3.7a1 1 0 0 1 0 1.4L8.6 12.5H5.4L2.8 9.9a1 1 0 0 1 0-1.4l5.3-5.7a1 1 0 0 1 1.4 0ZM6 6.5l4 4M8.6 12.5H14" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        <span class="hide-md">Erase</span>
+      </button>
     </div>
     <input id="imgFile" type="file" accept="image/png,image/jpeg,image/webp,image/gif" hidden>
+    <input id="objFile" type="file" accept="image/png,image/jpeg,image/webp,image/gif" hidden>
     <button class="btn ghost hide-sm" id="discard" disabled>Discard changes</button>
     <button class="btn" id="openAnother">
       <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M2 4.5A1.5 1.5 0 0 1 3.5 3H6l1.5 1.5h5A1.5 1.5 0 0 1 14 6v5.5a1.5 1.5 0 0 1-1.5 1.5h-9A1.5 1.5 0 0 1 2 11.5z" stroke="currentColor" stroke-width="1.5"/></svg>
@@ -244,6 +283,7 @@
   <span class="hide-sm"><kbd>Esc</kbd> undo</span>
   <span class="hide-sm">Hover a list and click <b style="color:var(--accent)">+</b> to add points</span>
   <span class="hide-sm">Use <b style="color:var(--ink)">Text</b>, <b style="color:var(--ink)">Image</b> or <b style="color:var(--ink)">Sign</b> to add something new</span>
+  <span class="hide-sm">Click a picture to move, replace or remove it</span>
   <button class="btn ghost close" id="hideHint">Got it</button>
 </div>
 
@@ -394,7 +434,7 @@ async function openFile(f) {
   try {
     const form = new FormData(); form.append("file", f);
     const data = await (await call("/analyze?previews=true", form)).json();
-    doc = data; pdfFile = f; edits.clear(); inserts.clear(); clearAdded(); selectedId = null; setupFonts();
+    doc = data; pdfFile = f; edits.clear(); inserts.clear(); clearAdded(); selectedId = null; setupFonts(); setupImages();
     $("#docname").textContent = f.name;
     $("#docpages").textContent = `· ${data.pages.length} page${data.pages.length === 1 ? "" : "s"}`;
     $("#welcome").hidden = true; $("#fmt").hidden = false; $("#viewer").hidden = false; $("#actions").hidden = false; $("#docinfo").hidden = false;
@@ -433,6 +473,13 @@ function render() {
       ? `<img alt="Page ${page.index + 1}" src="${page.preview}">`
       : `<div class="no-preview" style="height:${page.height * Z}px"></div>`;
 
+    // images already in the PDF: a clickable box on each, under the text so text over a photo stays
+    // editable (scans and full-page backgrounds aren't offered; Erase works on them)
+    (page.images || []).forEach(img => {
+      const im = imgById.get(img.id), o = objChange(im);
+      if (!im.full || o) el.appendChild(objBox(im, o, Z));
+    });
+
     // bullet symbols on their own aren't text people want to edit
     page.lines.filter(l => l.editable && /[\p{L}\p{N}]/u.test(l.text)).forEach(line => el.appendChild(lineBox(line, Z)));
 
@@ -455,6 +502,15 @@ function render() {
         el.appendChild(ln);
       }
     }));
+    (page.images || []).forEach(img => {
+      const o = objChange(imgById.get(img.id));
+      if (o && o.action === "replace" && o.allPages) el.appendChild(objPicture(o, Z, imgById.get(img.id)));
+    });
+    objs.forEach(o => { if (o.action !== "remove" && !o.allPages && o.page === page.index) el.appendChild(objPicture(o, Z)); });
+    erases.filter(er => er.page === page.index).forEach(er => el.appendChild(eraseBox(er, Z)));
+    if (eraseMode) el.classList.add("erasing");
+    el.addEventListener("pointerdown", e => { if (eraseMode && !page.rotated && !e.target.closest(".addn")) startBand(e, page.index, el); });
+
     added.filter(a => a.page === page.index).forEach(a => el.appendChild(addBox(a, Z)));
     viewer.appendChild(el);
     const label = document.createElement("div");
@@ -462,7 +518,7 @@ function render() {
     viewer.appendChild(label);
   });
   viewer.querySelectorAll(".addn.text").forEach(b => b._sync());   // text height needs the page on screen
-  updateFmt();
+  updateFmt(); showObjBar();
 }
 const points = text => text.split("\n").filter(s => s.trim());
 
@@ -597,6 +653,7 @@ function position(box, a, Z) {
   const [x0, y0, x1, y1] = a.rect;
   Object.assign(box.style, { left: x0 * Z + "px", top: y0 * Z + "px", width: (x1 - x0) * Z + "px",
                              height: a.type === "text" ? "auto" : (y1 - y0) * Z + "px" });
+  box._paint?.();
 }
 
 function addBox(a, Z) {
@@ -645,7 +702,8 @@ function select(id) {
   selectedId = id;
   if (prev && prev.type === "text" && !prev.text.trim()) { removeAdded(prev.id, true); return; }   // empty box: drop it
   document.querySelectorAll(".addn").forEach(b => b.classList.toggle("sel", b.dataset.id === id));
-  updateFmt();
+  document.querySelectorAll(".obj").forEach(b => b.classList.toggle("sel", b.dataset.key === id));
+  updateFmt(); showObjBar();
 }
 
 function removeAdded(id, quiet) {
@@ -658,8 +716,9 @@ function removeAdded(id, quiet) {
     { action: "Undo", onAction: () => { added.splice(i, 0, a); render(); refresh(); } });
 }
 
-// Move a box, or resize it from its corner (images keep their shape; text boxes change width).
-function startDrag(e, a, box, mode) {
+// Move a box, or resize it from its corner (images keep their shape; text boxes change width;
+// erase areas change freely). onEnd runs when the pointer is released.
+function startDrag(e, a, box, mode, onEnd) {
   e.preventDefault(); e.stopPropagation();
   document.activeElement?.blur?.();
   select(a.id);
@@ -698,6 +757,8 @@ function startDrag(e, a, box, mode) {
       if (!scrollTimer) scrollTimer = requestAnimationFrame(autoScroll);
     } else if (a.type === "text") {
       a.rect = [r0[0], r0[1], r0[0] + clamp(w0 + dx, 30, page.width - r0[0]), r0[3]];
+    } else if (a.type === "erase") {
+      a.rect = [r0[0], r0[1], r0[0] + clamp(w0 + dx, 6, page.width - r0[0]), r0[1] + clamp(h0 + dy, 6, page.height - r0[1])];
     } else {
       let w = clamp(w0 + Math.max(dx, dy * ratio), 16, page.width - r0[0]), h = w / ratio;
       if (r0[1] + h > page.height) { h = page.height - r0[1]; w = h * ratio; }
@@ -709,18 +770,235 @@ function startDrag(e, a, box, mode) {
   const up = () => {
     cancelAnimationFrame(scrollTimer);
     removeEventListener("pointermove", move); removeEventListener("pointerup", up); removeEventListener("pointercancel", up);
-    refresh();
+    onEnd?.();
+    refresh(); showObjBar();
   };
   addEventListener("pointermove", move); addEventListener("pointerup", up); addEventListener("pointercancel", up);
 }
 
-document.addEventListener("pointerdown", e => { if (selectedId && !e.target.closest(".addn, .addgroup, .fmt, dialog")) select(null); });
+document.addEventListener("pointerdown", e => {
+  if (selectedId && !e.target.closest(".addn, .obj, .objbar, .addgroup, .fmt, dialog")) select(null);
+});
 document.addEventListener("keydown", e => {
   if (selectedId && (e.key === "Delete" || e.key === "Backspace") && !e.target.closest("[contenteditable], input, textarea, select")) {
-    e.preventDefault(); removeAdded(selectedId);
+    e.preventDefault();
+    if (erases.some(x => x.id === selectedId)) removeErase(selectedId);
+    else if (imgById.has(selectedId)) setObj(imgById.get(selectedId), { action: "remove", allPages: objs.get(selectedId)?.allPages || false });
+    else removeAdded(selectedId);
   }
-  if (e.key === "Escape" && selectedId && !$("#sigDialog").open) { document.activeElement?.blur?.(); select(null); }
+  if (e.key === "Escape" && eraseMode) setEraseMode(false);
+  else if (e.key === "Escape" && selectedId && !$("#sigDialog").open) { document.activeElement?.blur?.(); select(null); }
 });
+
+// ---------- images already in the PDF: move, replace, remove ---------------------
+// A change is stored under the image's id; with allPages it applies to every copy of that picture.
+const objs = new Map();      // image id -> { type: "image", action: remove|move|replace, page, rect, allPages, blob, url }
+let erases = [];             // areas to erase: { id, type: "erase", page, rect, text }
+let eraseMode = false, replaceTarget = null;
+const imgById = new Map();   // image id -> its /analyze entry plus its page
+const allPref = new Map();   // image id -> "all copies" ticked before choosing an action
+
+function setupImages() {
+  imgById.clear(); objs.clear(); erases = []; allPref.clear(); setEraseMode(false);
+  doc.pages.forEach(p => (p.images || []).forEach(im => imgById.set(im.id, { ...im, page: p.index })));
+}
+
+// The change shown on an image copy: its own, or one made on all copies of its picture.
+function objChange(im) {
+  if (objs.has(im.id)) return objs.get(im.id);
+  if (im.group) for (const o of objs.values()) if (o.allPages && o.group === im.group) return o;
+  return null;
+}
+
+function setObj(im, change, quiet) {
+  const before = new Map(objs);
+  const o = { type: "image", id: im.id, group: im.group, origPage: im.page, bbox: im.bbox,
+              page: im.page, rect: [...im.bbox], allPages: false, ...(objs.get(im.id) || {}), ...change };
+  if (o.action !== "remove" && o.action !== "replace") o.allPages = false;
+  if (o.allPages) for (const [k, v] of objs) if (k !== o.id && v.group === o.group) objs.delete(k);
+  if (o.allPages && o.action === "replace") { o.page = im.page; o.rect = [...im.bbox]; }
+  objs.set(im.id, o); selectedId = im.id; render(); refresh();
+  if (!quiet && o.action === "remove")
+    toast(o.allPages ? `Image removed from all ${im.copies} places.` : "Image removed.", { action: "Undo", onAction: () => {
+      objs.clear(); before.forEach((v, k) => objs.set(k, v)); render(); refresh(); } });
+}
+
+function restoreObj(id) {
+  objs.delete(id); render(); refresh(); toast("Image restored.");
+}
+
+// Rectangle covering one image copy: click to select; drag an unchanged one to move it.
+function objBox(im, o, Z) {
+  const key = o ? o.id : im.id, el = document.createElement("div");
+  el.className = "obj" + (o ? " gone" : "") + (selectedId === key ? " sel" : "");
+  el.dataset.id = im.id; el.dataset.key = key;
+  el.dataset.label = !o ? "" : o.action === "remove" ? "Removed" : o.action === "move" ? "Moved" : "Replaced";
+  el.title = o ? "Click to restore or change" : "Click to replace or remove · drag to move";
+  el.setAttribute("aria-label", o ? `Image, ${el.dataset.label.toLowerCase()}` : "Image in the document");
+  const [x0, y0, x1, y1] = im.bbox;
+  Object.assign(el.style, { left: x0 * Z + "px", top: y0 * Z + "px", width: (x1 - x0) * Z + "px", height: (y1 - y0) * Z + "px" });
+  el.addEventListener("pointerdown", e => {
+    if (eraseMode || e.button > 0) return;
+    e.stopPropagation(); document.activeElement?.blur?.();
+    const wasSel = selectedId === key;
+    select(key);
+    if (o || (e.pointerType === "touch" && !wasSel)) return;        // on touch, the first tap only selects
+    const sx = e.clientX, sy = e.clientY;
+    const cancel = () => { removeEventListener("pointermove", watch); removeEventListener("pointerup", cancel); };
+    const watch = ev => {
+      if (Math.hypot(ev.clientX - sx, ev.clientY - sy) < 4) return;
+      cancel();
+      setObj(im, { action: "move" }, true);                      // becomes a movable copy of the picture
+      const o2 = objs.get(im.id), box = document.querySelector(`.addn[data-id="${im.id}"]`);
+      startDrag(e, o2, box, "move", () => {                        // dropped back where it was: no change
+        if (o2.page === im.page && o2.rect.every((v, i) => Math.abs(v - im.bbox[i]) < 0.5)) { objs.delete(im.id); render(); refresh(); }
+        else render();
+      });
+    };
+    addEventListener("pointermove", watch); addEventListener("pointerup", cancel);
+  });
+  return el;
+}
+
+// A moved or replacement picture. `at` = a copy where an all-pages replacement is drawn (not draggable).
+function objPicture(o, Z, at) {
+  const a = at ? { ...o, page: at.page, rect: at.bbox } : o;
+  const box = document.createElement("div");
+  box.className = "addn image" + (o.id === selectedId ? " sel" : "");
+  box.dataset.id = o.id;
+  if (o.action === "replace") {
+    box.innerHTML = `<img alt="Replacement image" src="${o.url}">`;
+  } else {
+    const prev = doc.pages[o.origPage].preview, pic = document.createElement("div");
+    pic.className = "objpic" + (prev ? "" : " none");
+    if (!prev) pic.textContent = "Image";
+    box.appendChild(pic);
+    box._paint = () => {                                           // the picture, cut from the page preview
+      if (!prev) return;
+      const k = (o.rect[2] - o.rect[0]) / (o.bbox[2] - o.bbox[0]);
+      Object.assign(pic.style, { backgroundImage: `url("${prev}")`, backgroundSize: `${doc.pages[o.origPage].width * Z * k}px auto`,
+                                 backgroundPosition: `${-o.bbox[0] * Z * k}px ${-o.bbox[1] * Z * k}px` });
+    };
+  }
+  position(box, a, Z);
+  if (!at) {
+    box.insertAdjacentHTML("beforeend", `<button class="h h-del" title="Remove" aria-label="Remove">${ICON.del}</button>
+                                         <button class="h h-size" title="Resize" aria-label="Resize">${ICON.size}</button>`);
+    box.querySelector(".h-del").onclick = e => { e.stopPropagation(); setObj(imgById.get(o.id), { action: "remove" }); };
+    box.querySelector(".h-size").addEventListener("pointerdown", e => startDrag(e, o, box, "size"));
+    box.addEventListener("pointerdown", e => { if (!e.target.closest(".h")) startDrag(e, o, box, "move"); });
+  } else {
+    box.style.cursor = "pointer";
+    box.addEventListener("pointerdown", e => { e.stopPropagation(); select(o.id); });
+  }
+  return box;
+}
+
+function pickReplacement(im) { replaceTarget = im; $("#objFile").click(); }
+$("#objFile").addEventListener("change", async e => {
+  const f = e.target.files[0], im = replaceTarget; e.target.value = ""; replaceTarget = null;
+  if (!f || !im) return;
+  try {
+    const img = await loadImage(f);
+    setObj(im, { action: "replace", ...img, allPages: objs.get(im.id)?.allPages ?? allPref.get(im.id) ?? false });
+  } catch { toast("This image can't be used. Please choose a JPG or PNG.", { error: true }); }
+});
+
+// ---------- erase an area -------------------------------------------------------
+$("#addErase").onclick = () => setEraseMode(!eraseMode);
+function setEraseMode(on) {
+  eraseMode = on;
+  $("#addErase").setAttribute("aria-pressed", on);
+  document.querySelectorAll(".page").forEach(p => p.classList.toggle("erasing", on));
+  if (on) { select(null); toast("Drag over what you want to erase. Press Esc to cancel.", { ms: 5000 }); }
+  else if ($("#toastText").textContent.startsWith("Drag over")) $("#toast").classList.remove("show");
+  $("#addErase").blur();
+}
+
+function startBand(e, pageIndex, el) {
+  e.preventDefault(); e.stopPropagation();
+  const Z = zoom * PT, p = doc.pages[pageIndex], r = el.getBoundingClientRect();
+  const pt = ev => [clamp((ev.clientX - r.left) / Z, 0, p.width), clamp((ev.clientY - r.top) / Z, 0, p.height)];
+  const [ax, ay] = pt(e), band = document.createElement("div");
+  band.className = "band"; el.appendChild(band);
+  let rect = [ax, ay, ax, ay];
+  const move = ev => {
+    const [bx, by] = pt(ev);
+    rect = [Math.min(ax, bx), Math.min(ay, by), Math.max(ax, bx), Math.max(ay, by)];
+    Object.assign(band.style, { left: rect[0] * Z + "px", top: rect[1] * Z + "px", width: (rect[2] - rect[0]) * Z + "px", height: (rect[3] - rect[1]) * Z + "px" });
+  };
+  const up = () => {
+    removeEventListener("pointermove", move); removeEventListener("pointerup", up); removeEventListener("pointercancel", up);
+    band.remove();
+    if ((rect[2] - rect[0]) * Z < 6 || (rect[3] - rect[1]) * Z < 6) return;      // a click, not a drag
+    const er = { id: `er-${++addSeq}`, type: "erase", page: pageIndex, rect, text: false };
+    erases.push(er); setEraseMode(false); selectedId = er.id; render(); refresh();
+  };
+  addEventListener("pointermove", move); addEventListener("pointerup", up); addEventListener("pointercancel", up);
+}
+
+function eraseBox(er, Z) {
+  const box = document.createElement("div");
+  box.className = "addn erase" + (er.id === selectedId ? " sel" : "");
+  box.dataset.id = er.id;
+  box.setAttribute("aria-label", "Area to erase");
+  position(box, er, Z);
+  box.innerHTML = `<button class="h h-del" title="Remove" aria-label="Remove">${ICON.del}</button>
+                   <button class="h h-size" title="Resize" aria-label="Resize">${ICON.size}</button>`;
+  box.querySelector(".h-del").onclick = e => { e.stopPropagation(); removeErase(er.id); };
+  box.querySelector(".h-size").addEventListener("pointerdown", e => startDrag(e, er, box, "size"));
+  box.addEventListener("pointerdown", e => { if (!e.target.closest(".h")) startDrag(e, er, box, "move"); });
+  return box;
+}
+
+function removeErase(id) {
+  const i = erases.findIndex(x => x.id === id);
+  if (i < 0) return;
+  const [er] = erases.splice(i, 1);
+  if (selectedId === id) selectedId = null;
+  render(); refresh();
+  toast("Erase area removed.", { action: "Undo", onAction: () => { erases.splice(i, 0, er); render(); refresh(); } });
+}
+
+// Small toolbar next to a selected image or erase area.
+function showObjBar() {
+  document.querySelector(".objbar")?.remove();
+  const id = selectedId;
+  if (!id || !doc) return;
+  const er = erases.find(x => x.id === id), im = imgById.get(id);
+  if (!er && !im) return;
+  const anchor = document.querySelector(`.addn[data-id="${id}"]`) || document.querySelector(`.obj[data-key="${id}"]`);
+  if (!anchor) return;
+  const o = im && objs.get(id), bar = document.createElement("div");
+  bar.className = "objbar"; bar.setAttribute("role", "toolbar"); bar.setAttribute("aria-label", er ? "Erase area" : "Image");
+  const add = (label, fn, cls = "") => {
+    const b = Object.assign(document.createElement("button"), { type: "button", textContent: label, className: cls });
+    b.onclick = e => { e.stopPropagation(); fn(); }; bar.appendChild(b);
+  };
+  const check = (label, on, fn) => {
+    const l = document.createElement("label"), c = Object.assign(document.createElement("input"), { type: "checkbox", checked: on });
+    c.onchange = () => fn(c.checked); l.append(c, label); bar.appendChild(l);
+  };
+  const sep = () => bar.appendChild(Object.assign(document.createElement("span"), { className: "sep" }));
+  if (er) {
+    check("Also remove text", er.text, v => { er.text = v; });
+    sep(); add("Remove area", () => removeErase(er.id), "danger");
+  } else {
+    if (!o || o.action !== "remove") { add("Replace…", () => pickReplacement(im)); add("Remove", () => setObj(im, { action: "remove", allPages: o?.allPages ?? allPref.get(im.id) ?? false }), "danger"); }
+    if (im.copies > 1 && (!o || o.action !== "move")) {
+      sep();
+      check(`All ${im.copies} copies`, o ? o.allPages : !!allPref.get(im.id), v => {
+        if (o) setObj(im, { allPages: v }, true); else allPref.set(im.id, v);
+      });
+    }
+    if (o) { sep(); add("Restore", () => restoreObj(o.id)); }
+  }
+  const pageEl = anchor.closest(".page");
+  pageEl.appendChild(bar);
+  const top = anchor.offsetTop - bar.offsetHeight - 10;
+  bar.style.top = (top >= 0 ? top : anchor.offsetTop + anchor.offsetHeight + 10) + "px";
+  bar.style.left = clamp(anchor.offsetLeft, 0, pageEl.clientWidth - bar.offsetWidth) + "px";
+}
 
 // ---------- format bar: shows the style of the text you click, edits text boxes ---
 const fontKey = name => { const f = name.split("+").pop().split(/[-,]/)[0]; return f.replace(/(PSMT|MT|PS)$/, "") || f; };
@@ -764,7 +1042,8 @@ function setupFonts() {
 function fmtState() {
   const ln = document.activeElement?.closest?.(".ln");
   if (ln && lineById.has(ln.dataset.id)) return { kind: "line", line: lineById.get(ln.dataset.id) };
-  const a = added.find(x => x.id === selectedId);
+  const a = added.find(x => x.id === selectedId) || erases.find(x => x.id === selectedId)
+         || (imgById.has(selectedId) ? { type: "image" } : null);
   if (a) return { kind: a.type === "text" ? "box" : "other", a };
   return { kind: "new" };
 }
@@ -777,7 +1056,9 @@ function updateFmt() {
     s = newStyle = styleOfLine(st.line);                  // like Word's format painter: new text boxes match
     label = "Selected text"; note = "New text boxes will use this style";
   } else if (st.kind === "box") { s = st.a; label = "Text box"; note = ""; }
-  else if (st.kind === "other") { label = st.a.type === "image" ? "Image" : "Signature"; note = "Select text to see its style"; }
+  else if (st.kind === "other") {
+    label = st.a.type === "image" ? "Image" : st.a.type === "erase" ? "Erase area" : "Signature"; note = "Select text to see its style";
+  }
   const bar = $("#fmt");
   bar.classList.toggle("ro", st.kind === "line"); bar.classList.toggle("off", st.kind === "other");
   bar.querySelectorAll("select, input").forEach(c => c.disabled = st.kind === "line" || st.kind === "other");
@@ -865,7 +1146,7 @@ function placeSignature(sig) {
 }
 
 // ---------- toolbar -----------------------------------------------------------
-const pending = () => edits.size + inserts.size + added.length;
+const pending = () => edits.size + inserts.size + added.length + objs.size + erases.length;
 function refresh() {
   const n = pending();
   $("#save").disabled = !n; $("#discard").disabled = !n;
@@ -881,10 +1162,11 @@ $("#zoomIn").onclick = () => setZoom(ZOOMS.find(z => z > zoom + 0.01) || 2);
 $("#zoomOut").onclick = () => setZoom([...ZOOMS].reverse().find(z => z < zoom - 0.01) || 0.5);
 
 $("#discard").onclick = () => {
-  const saved = [new Map(edits), new Map(inserts), added];
-  edits.clear(); inserts.clear(); added = []; selectedId = null; render(); refresh();
+  const saved = [new Map(edits), new Map(inserts), added, new Map(objs), erases];
+  edits.clear(); inserts.clear(); added = []; objs.clear(); erases = []; selectedId = null; render(); refresh();
   toast("All changes discarded.", { action: "Undo", onAction: () => {
-    saved[0].forEach((v, k) => edits.set(k, v)); saved[1].forEach((v, k) => inserts.set(k, v)); added = saved[2]; render(); refresh();
+    saved[0].forEach((v, k) => edits.set(k, v)); saved[1].forEach((v, k) => inserts.set(k, v)); added = saved[2];
+    saved[3].forEach((v, k) => objs.set(k, v)); erases = saved[4]; render(); refresh();
   }});
 };
 function confirmDiscard() {
@@ -923,11 +1205,17 @@ $("#save").addEventListener("click", async () => {
       ? { type: "text", page: a.page, rect: a.rect.map(r2), text: a.text, font: a.font, ...(a.font === "doc" ? { fontFrom: a.fontFrom } : {}),
           size: a.size, color: a.color, bold: a.bold, italic: a.italic }
       : { type: a.type, page: a.page, rect: a.rect.map(r2), imageId: a.id }),
+    objects: [...objs.values()].map(o => o.action === "remove" ? { id: o.id, action: "remove", allPages: o.allPages }
+      : o.action === "move" ? { id: o.id, action: "move", page: o.page, rect: o.rect.map(r2) }
+      : o.allPages ? { id: o.id, action: "replace", imageId: "rep-" + o.id, allPages: true }
+      : { id: o.id, action: "replace", imageId: "rep-" + o.id, page: o.page, rect: o.rect.map(r2) }),
+    erase: erases.map(er => ({ page: er.page, rect: er.rect.map(r2), text: er.text })),
   };
   busy("Applying your changes…");
   try {
     const form = new FormData(); form.append("file", pdfFile); form.append("changes", JSON.stringify(body));
     added.forEach(a => a.blob && form.append("images", a.blob, a.id));
+    objs.forEach(o => o.action === "replace" && form.append("images", o.blob, "rep-" + o.id));
     const res = await call("/edit", form);
     let notes = [];
     try { notes = JSON.parse(res.headers.get("X-Edit-Warnings") || "[]"); } catch {}

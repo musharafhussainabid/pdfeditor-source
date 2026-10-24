@@ -27,7 +27,7 @@ docker run -p 8080:8080 pdf-editor
 ```
 
 ## The API
-- **`POST /analyze`** (multipart: `file` = PDF) returns the editable lines and lists of each page,
+- **`POST /analyze`** (multipart: `file` = PDF) returns the editable lines, lists and pictures of each page,
   with ids, positions (PDF points from the top-left) and styles. `?previews=true` adds page images.
 - **`POST /edit`** (multipart: `file` = the same PDF, `changes` = JSON, optional `images` = PNG/JPEG files)
   returns the edited PDF. `changes`:
@@ -36,9 +36,14 @@ docker run -p 8080:8080 pdf-editor
     "inserts":   [{ "listId": "p0-L0", "afterItem": 1, "items": ["New point", "- a sub-point"] }],
     "additions": [{ "type": "text", "page": 0, "rect": [72, 700, 300, 740], "text": "Hello",
                     "font": "sans", "size": 12, "color": "#000000" },
-                  { "type": "signature", "page": 0, "rect": [350, 700, 520, 760], "imageId": "sig-1" }] }
+                  { "type": "signature", "page": 0, "rect": [350, 700, 520, 760], "imageId": "sig-1" }],
+    "objects":   [{ "id": "p0-i3", "action": "remove", "allPages": true },
+                  { "id": "p0-i5", "action": "move", "page": 1, "rect": [80, 400, 200, 480] },
+                  { "id": "p1-i0", "action": "replace", "imageId": "new-logo" }],
+    "erase":     [{ "page": 0, "rect": [60, 495, 200, 565], "text": false }] }
   ```
-  An image or signature's `imageId` is the file name of one `images` part.
+  An `imageId` is the file name of one `images` part. `objects` changes pictures already in the PDF
+  (by their id from `/analyze`); `erase` removes everything drawn inside an area (text only if `"text": true`).
   Notices come in the `X-Edit-Warnings` header (JSON list).
 - Errors: `{"error": {"code", "message", "requestId"}}`.
 
