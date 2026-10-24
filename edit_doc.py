@@ -2099,8 +2099,11 @@ def insert_items(doc, orig_bytes, info, ins, models, fc, warnings, dry_run=False
     # Is the list in a column with other content beside it? Then only that
     # column may move; shifting the full width would tear the other columns.
     cx0, cx1 = column_range(model, lx0, lx1, a, Y2, W)
-    in_column = any(r.y1 > a + EPS and r.y0 < Y2 - EPS and not _hov(r, cx0, cx1)
-                    for r in model["text"] + model["img"])
+    # Only content running alongside the list's column counts as another column: something that
+    # starts below everything in the column (a centred footer note, say) is just further down the page.
+    below = [r for r in model["text"] + model["img"] if r.y1 > a + EPS and r.y0 < Y2 - EPS]
+    col_bottom = max([r.y1 for r in below if _hov(r, cx0, cx1)], default=a)
+    in_column = any(not _hov(r, cx0, cx1) and r.y0 < col_bottom - EPS for r in below)
     if not in_column:
         cx0, cx1 = 0.0, W
 
@@ -2234,6 +2237,9 @@ def insert_items(doc, orig_bytes, info, ins, models, fc, warnings, dry_run=False
             tgt["fresh"] = False
             prev, last_rel = bl, L["rel"]
         off = prev - anchor - (D - Dm)  # content below keeps its distance to the new text
+        if tgt["xref"] != pxref:
+            # the new text continued on another page: whatever comes next goes below it, not over it
+            tgt["cursor"] = prev + desc
         if tgt["xref"] == pxref:
             patch_ops.append((pxref, C, C, min(C + off, limit), 0, W, patch))
         else:
@@ -2242,7 +2248,7 @@ def insert_items(doc, orig_bytes, info, ins, models, fc, warnings, dry_run=False
 
         # 2. the content below, then each reflowed page's own content
         queue.insert(0, segment(pxref, C, Y2))
-        cursor, continuing = None, True
+        cursor, continuing = tgt.pop("cursor", None), True
         guard = 0
         while queue:
             seg = queue.pop(0)
