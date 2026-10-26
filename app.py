@@ -206,10 +206,10 @@ async def read_pdf(file):
     return data
 
 
-def analysis(data):
+def analysis(data, detail_pages=None):
     """The engine's analysis (runs in an engine process)."""
     try:
-        return edit_doc.analyze(data, max_pages=MAX_PAGES)
+        return edit_doc.analyze(data, max_pages=MAX_PAGES, detail_pages=detail_pages)
     except edit_doc.PdfRejected as exc:
         raise RequestError(422, {"code": exc.code, "message": str(exc)})
 
@@ -381,7 +381,13 @@ def _edit(data, changes, files):
         raise HTTPException(400, "'changes' must be JSON.")
     if not isinstance(body, dict):
         raise HTTPException(400, "'changes' must be a JSON object.")
-    info, _layout = analysis(data)   # same PDF -> same analysis -> the ids from /analyze match
+    # Same PDF -> same analysis -> the ids from /analyze match. Only the pages whose text or lists
+    # change need the slow part of the analysis (columns, lists): much faster for long or dense PDFs.
+    detail = {int(m[1]) for m in (re.match(r"p(\d+)-", str(x.get("lineId", "") if isinstance(x, dict) else ""))
+                                  for x in body.get("edits") or []) if m}
+    detail |= {int(m[1]) for m in (re.match(r"p(\d+)-", str(x.get("listId", "") if isinstance(x, dict) else ""))
+                                   for x in body.get("inserts") or []) if m}
+    info, _layout = analysis(data, detail)
     edits, inserts = [], []
     pages = info["pages"]
     for e in body.get("edits") or []:

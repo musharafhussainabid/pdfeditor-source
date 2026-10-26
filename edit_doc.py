@@ -894,7 +894,7 @@ def _numbering(tokens):
     return {"style": style, "prefix": pre, "suffix": suf}, (romans if use_roman else alphas)
 
 
-def detect_lists(page, lines):
+def detect_lists(page, lines, drawings=None):
     """Group lines into bulleted/numbered lists and measure their geometry."""
     W = page.rect.width
     L = lines
@@ -936,7 +936,7 @@ def detect_lists(page, lines):
             markers[i] = dict(L[j]["_marker"], text_x=l["x"], marker_line=j)
 
     # bullet drawn as a vector shape
-    drawings = page.get_drawings()
+    drawings = page.get_drawings() if drawings is None else drawings
     area = page.rect.get_area()
     images = [fitz.Rect(x["bbox"]) for x in page.get_image_info()]
     # Only bullet-sized drawings can be (part of) a bullet. Pages with tables can have thousands
@@ -948,12 +948,16 @@ def detect_lists(page, lines):
         w, h = max(r.x1 - r.x0, 0), max(r.y1 - r.y0, 0)   # as Rect.width / height
         if w <= 0.9 * max_sz and h <= 0.9 * max_sz:
             small.append((r.x0, r.y0, r.x1, r.y1, w, h, d))
+    # small drawings by vertical centre: a line only looks at those level with it (in drawing order)
+    small_cy = sorted(range(len(small)), key=lambda k: ((small[k][1] + small[k][3]) / 2, k))
+    cys_small = [(small[k][1] + small[k][3]) / 2 for k in small_cy]
     for i, l in enumerate(L):
         if i in markers or not l["editable"] or l.get("_marker"):
             continue
         sz, bb, lx = l["size"], box(i), l["x"]
         best = None
-        for x0, y0, x1, y1, w, h, d in small:
+        level = sorted(small_cy[bisect.bisect_left(cys_small, bb.y0 - 1e-6):bisect.bisect_right(cys_small, bb.y1 + 1e-6)])
+        for x0, y0, x1, y1, w, h, d in (small[k] for k in level):
             if not (0.8 <= w <= 0.9 * sz and 0.8 <= h <= 0.9 * sz):
                 continue
             cy = (y0 + y1) / 2
@@ -975,17 +979,24 @@ def detect_lists(page, lines):
 
     member = set(markers) | used_lone
     assigned = set()
+    # Lines indexed by baseline and by vertical centre: the searches below look only at the
+    # lines in the right height band instead of every line on the page (same results).
+    by_base = sorted(range(len(L)), key=lambda j: (base(j), j))
+    bases = [base(j) for j in by_base]
+    centre = [(b.y0 + b.y1) / 2 for b in boxes]
+    by_cy = sorted(range(len(L)), key=lambda j: (centre[j], j))
+    cys = [centre[j] for j in by_cy]
 
     def lines_between(top, bot, x0, x1, skip):
         out = []
-        for j, l in enumerate(L):
+        for j in by_cy[bisect.bisect_right(cys, top):bisect.bisect_left(cys, bot)]:
             if j in skip:
                 continue
             b = box(j)
-            cy = (b.y0 + b.y1) / 2
+            cy = centre[j]
             if top < cy < bot and b.x1 > x0 and b.x0 < x1:
                 out.append(j)
-        return out
+        return sorted(out)
 
     # items: marker line + wrapped continuation lines at the text indent
     items = []
@@ -995,14 +1006,18 @@ def detect_lists(page, lines):
         cur = i
         while True:
             cand = None
-            for j, l in enumerate(L):
+            b0 = base(cur)
+            lo = bisect.bisect_left(bases, b0 + 0.3 * sz - 1e-6)
+            hi = bisect.bisect_right(bases, b0 + 2.2 * sz + 1e-6)
+            for j in by_base[lo:hi]:          # nearest baseline first, then lowest index
                 if j in member or j in assigned or j in it["lines"]:
                     continue
-                db = base(j) - base(cur)
+                l = L[j]
+                db = base(j) - b0
                 if (abs(l["x"] - m["text_x"]) <= 2 and 0.3 * sz < db <= 2.2 * sz
                         and abs(l["size"] - sz) <= 1.5):
-                    if cand is None or base(j) < base(cand):
-                        cand = j
+                    cand = j
+                    break
             if cand is None:
                 break
             if lines_between(box(cur).y1 - 0.5, box(cand).y0 + 0.5, m["bbox"][0], box(cand).x1,
@@ -1287,7 +1302,7 @@ def page_bands(doc, all_lines):
 # --------------------------------------------------------------------------- #
 # Column boundaries: how far each line may extend before it must wrap
 # --------------------------------------------------------------------------- #
-def column_rights(page, lines):
+def column_rights(page, lines, drawings=None):
     """
     Column bounds for every editable line: line["left"] and line["right"] are how far
     its text may extend (table cell or box edges, neighbouring columns, or the page's
@@ -1310,7 +1325,7 @@ def column_rights(page, lines):
                 return True
         return False
 
-    for d in page.get_drawings():
+    for d in page.get_drawings() if drawings is None else drawings:
         if is_background(d, area):
             continue
         r = ink_rect(d)
@@ -1407,8 +1422,8 @@ def _bounds(lines, extent, vedges, spans, body_left, body_right):
                 and s[2] <= tb[3] + 4 * sz and s[3] >= tb[1] - 4 * sz]
         if near:
             x0s, x1s = min(near, key=lambda s: s[1] - s[0])[:2]
-            pads = [o["x"] - x0s for o in lines if x0s - 0.5 <= o["x"] <= x1s
-                    and abs((o["tbox"][1] + o["tbox"][3]) / 2 - cy) < 30 * sz]
+            pads = [o["x"] - x0s for o in (lines[j] for j in l_idx.near(cy - 30 * sz, cy + 30 * sz))
+                    if x0s - 0.5 <= o["x"] <= x1s and abs((o["tbox"][1] + o["tbox"][3]) / 2 - cy) < 30 * sz]
             pad = min(pads) if pads else 4.0
             rc.append(x1s - pad)
             lc.append(x0s + pad)
@@ -1422,6 +1437,14 @@ def line_alignment(lines):
     for l in lines:
         l["align"] = "left"
     undecided = []
+    # Only lines in the same column (overlapping horizontally) can vote: index the editable lines
+    # by vertical strips of the page, so each line is compared with its own strips only.
+    strip = 40.0
+    grid = {}
+    for o in lines:
+        if o["editable"]:
+            for b in range(int(o["tbox"][0] // strip), int(o["tbox"][2] // strip) + 1):
+                grid.setdefault(b, []).append(o)
     for l in lines:
         if not l["editable"]:
             continue
@@ -1429,7 +1452,13 @@ def line_alignment(lines):
         x0, x1 = l["tbox"][0], l["tbox"][2]
         c = (x0 + x1) / 2
         votes = {"left": 0, "center": 0, "right": 0}
-        for o in lines:
+        seen, band = set(), []
+        for b in range(int(x0 // strip), int(x1 // strip) + 1):
+            for o in grid.get(b, ()):
+                if id(o) not in seen:
+                    seen.add(id(o))
+                    band.append(o)
+        for o in band:
             if o is l or not o["editable"] or abs(o["tbox"][1] - l["tbox"][1]) > 40 * sz:
                 continue
             if abs(o["size"] - sz) > 0.5 or (o["flags"] & 16) != (l["flags"] & 16):
@@ -1464,9 +1493,16 @@ def line_alignment(lines):
             else:
                 undecided.append(l)  # fills its column: no evidence either way
     # no evidence of its own: follow the other cells on the same table row
+    # "o in undecided" compares lines by content (a line printed twice in one spot counts too);
+    # a cheap key check first keeps that meaning without scanning the list for every line
+    ids, keys = {id(o) for o in undecided}, {(o["text"], tuple(o["bbox"])) for o in undecided}
+
+    def is_undecided(o):
+        return id(o) in ids or ((o["text"], tuple(o["bbox"])) in keys and o in undecided)
+
     for l in undecided:
         sz = l["size"]
-        mates = [o["align"] for o in lines if o is not l and o not in undecided and o["editable"]
+        mates = [o["align"] for o in lines if o is not l and not is_undecided(o) and o["editable"]
                  and abs(o["origin"][1] - l["origin"][1]) < 0.3 * sz]
         # only for centered tables; otherwise columns differ (text left, numbers right)
         if len(mates) >= 2 and mates.count("center") > len(mates) / 2:
@@ -1671,20 +1707,44 @@ def _joins(lines, a, b):
     return fresh < 2
 
 
+_order_cache = [None, 0, None]   # (the lines list itself, its length, the index): one page at a time
+
+
+def _line_order(lines):
+    """Editable lines sorted by baseline (then index), and their (baseline, index) keys for bisect.
+    Built once per page's line list; _paragraph is called for many lines of the same page."""
+    if _order_cache[0] is lines and _order_cache[1] == len(lines):
+        return _order_cache[2]
+    order = sorted((j for j, o in enumerate(lines) if o["editable"]), key=lambda j: (lines[j]["origin"][1], j))
+    result = (order, [(lines[j]["origin"][1], j) for j in order])
+    _order_cache[:] = [lines, len(lines), result]
+    return result
+
+
 def _paragraph(lines, idx):
     """Lines of the paragraph holding line idx, found from the layout: consecutive
     lines in one column, aligned alike, each line full before the next begins."""
+    order, keys = _line_order(lines)
+
     def neighbour(i, below):
+        """The nearest editable line above / below that overlaps it horizontally (ties: lowest index).
+        Walks outward through the lines sorted by baseline instead of scanning them all."""
         l = lines[i]
-        best = None
-        for j, o in enumerate(lines):
-            if j == i or not o["editable"]:
+        y, lim = l["origin"][1], 0.2 * l["size"]
+        if below:      # baselines strictly below y + lim, nearest first
+            seq = order[bisect.bisect_right(keys, (y + lim, float("inf"))):]
+        else:          # baselines strictly above y - lim, nearest first
+            seq = reversed(order[:bisect.bisect_left(keys, (y - lim, -1))])
+        best = best_y = None
+        for j in seq:
+            oy = lines[j]["origin"][1]
+            if best is not None and oy != best_y:
+                break                                   # past the nearest baseline that had a match
+            if j == i:
                 continue
-            d = o["origin"][1] - l["origin"][1]
-            if (d > 0.2 * l["size"]) if below else (d < -0.2 * l["size"]):
-                if min(o["tbox"][2], l["tbox"][2]) > max(o["tbox"][0], l["tbox"][0]):
-                    if best is None or abs(d) < abs(lines[best]["origin"][1] - l["origin"][1]):
-                        best = j
+            o = lines[j]
+            if min(o["tbox"][2], l["tbox"][2]) > max(o["tbox"][0], l["tbox"][0]) and (best is None or j < best):
+                best, best_y = j, oy
         return best
 
     para = [idx]
@@ -2825,8 +2885,11 @@ def warm_up():
     return True
 
 
-def analyze(pdf_bytes, max_pages=None):
-    """Extract editable lines and lists. Returns (info, layout)."""
+def analyze(pdf_bytes, max_pages=None, detail_pages=None):
+    """Extract editable lines and lists. Returns (info, layout).
+    detail_pages: when saving, the pages being changed. Only those get the slow part (column
+    bounds and list detection); every page still gets its lines, ids, styles, pictures and
+    header/footer bands, so ids and everything else stay exactly as /analyze reported them."""
     try:
         doc = fitz.open("pdf", pdf_bytes)
     except Exception:
@@ -2845,8 +2908,11 @@ def analyze(pdf_bytes, max_pages=None):
                 copies[im["xref"]] = copies.get(im["xref"], 0) + 1
     pages, layout_pages = [], []
     for pno, (page, lines, band) in enumerate(zip(doc, all_lines, bands)):
-        column_rights(page, lines)
-        lists = detect_lists(page, lines) if lines else []
+        lists = []
+        if detail_pages is None or pno in detail_pages:
+            drawings = page.get_drawings()          # read once, used by both steps
+            column_rights(page, lines, drawings)
+            lists = detect_lists(page, lines, drawings) if lines else []
         for l in lines:
             l.pop("_marker", None)
         pages.append({"lines": lines, "lists": lists, "images": all_images[pno], **band})
