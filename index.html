@@ -433,18 +433,104 @@ async function openFile(f) {
   busy("Opening your document…");
   try {
     const form = new FormData(); form.append("file", f);
-    const data = await (await call("/analyze?previews=true", form)).json();
+    // Page images are drawn here in the browser (pdf.js), loaded while the server reads the text.
+    // If pdf.js can't load (blocked or offline CDN), ask the server for the images as before.
+    const lib = withTimeout(loadPdfjs(), 10000).catch(() => null);
+    const data = await (await call("/analyze", form)).json();
+    const pdfjs = await lib;
+    if (!pdfjs) {
+      const withImages = await (await call("/analyze?previews=true", form)).json();
+      data.pages.forEach((p, i) => { p.preview = withImages.pages[i]?.preview; });
+    }
+    clearPreviews();
     doc = data; pdfFile = f; edits.clear(); inserts.clear(); clearAdded(); selectedId = null; setupFonts(); setupImages();
     $("#docname").textContent = f.name;
     $("#docpages").textContent = `· ${data.pages.length} page${data.pages.length === 1 ? "" : "s"}`;
     $("#welcome").hidden = true; $("#fmt").hidden = false; $("#viewer").hidden = false; $("#actions").hidden = false; $("#docinfo").hidden = false;
     $("#notice").hidden = true; $("#hint").hidden = store.get("hintSeen") === "1";
     zoom = fitZoom(); render(); refresh(); window.scrollTo(0, 0);
+    if (pdfjs) drawPages(pdfjs, f, data);           // in the background; pages appear as they're drawn
     if (data.signed) showNotice("This PDF is digitally signed:",
       ["Saving any change will make its existing digital signature invalid."]);
     if (!data.hasText) toast("This PDF is a scanned image, so its text can't be edited. You can still add text, images and a signature.", { error: true, ms: 7000 });
   } catch (e) { toast(e.message, { error: true, ms: 6000 }); }
   finally { busy(null); $("#file").value = ""; }
+}
+
+// ---------- page images, drawn in the browser with pdf.js ------------------------
+// Pinned version with integrity hashes: the browser refuses a changed file.
+const PDFJS = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/";
+const PDFJS_SRI = {
+  lib: "sha512-q+4liFwdPC/bNdhUpZx6aXDx/h77yEQtn4I1slHydcbZK34nLaR3cAeYSJshoxIOq3mjEf7xJE8YWIUHMn+oCQ==",
+  worker: "sha512-BbrZ76UNZq5BhH7LL7pn9A4TKQpQeNCHOo65/akfelcIBbcVvYWOFQKPXIrykE3qZxYjmDX573oa4Ywsc7rpTw==",
+};
+let pdfjsReady = null, drawJob = 0, previewUrls = [];
+const withTimeout = (p, ms) => Promise.race([p, new Promise((_, no) => setTimeout(() => no(new Error("timeout")), ms))]);
+
+function loadPdfjs() {
+  pdfjsReady ??= (async () => {
+    await new Promise((ok, fail) => {
+      const s = Object.assign(document.createElement("script"),
+        { src: PDFJS + "pdf.min.js", integrity: PDFJS_SRI.lib, crossOrigin: "anonymous", onload: ok, onerror: fail });
+      document.head.appendChild(s);
+    });
+    // the worker can't carry an integrity attribute: fetch it with one, then start it from that copy
+    const w = await fetch(PDFJS + "pdf.worker.min.js", { integrity: PDFJS_SRI.worker });
+    if (!w.ok) throw new Error("pdf.js worker");
+    window.pdfjsLib.GlobalWorkerOptions.workerSrc = URL.createObjectURL(new Blob([await w.text()], { type: "text/javascript" }));
+    return window.pdfjsLib;
+  })().catch(e => { pdfjsReady = null; throw e; });   // try again with the next file
+  return pdfjsReady;
+}
+
+function clearPreviews() {
+  drawJob++;                                         // stops drawing the previous document
+  previewUrls.forEach(u => URL.revokeObjectURL(u)); previewUrls = [];
+}
+
+// Draw each page to an image: the one on screen first, then outward. Pages show up as they finish.
+async function drawPages(pdfjs, file, data) {
+  const job = drawJob;
+  let pdf;
+  try { pdf = await pdfjs.getDocument({ data: new Uint8Array(await file.arrayBuffer()) }).promise; }
+  catch { return; }                                  // the text overlay still works without images
+  const n = data.pages.length, start = Math.min(n - 1, visibleSpot().page);
+  const order = [...Array(n).keys()].sort((a, b) => Math.abs(a - start) - Math.abs(b - start) || a - b);
+  // sharp at the default zoom on this screen; long documents a little lighter to save memory
+  const scale = Math.min(n > 60 ? 1.6 : 2.5, Math.max(1.4, 1.25 * PT * (window.devicePixelRatio || 1)));
+  try {
+    for (const i of order) {
+      if (job !== drawJob || doc !== data) return;   // another file was opened
+      if (data.pages[i].preview) continue;
+      try {
+        const page = await pdf.getPage(i + 1);
+        const vp = page.getViewport({ scale });
+        const c = document.createElement("canvas");
+        c.width = Math.ceil(vp.width); c.height = Math.ceil(vp.height);
+        const g = c.getContext("2d"); g.fillStyle = "#fff"; g.fillRect(0, 0, c.width, c.height);
+        await page.render({ canvasContext: g, viewport: vp }).promise;
+        page.cleanup();
+        const blob = await new Promise(ok => c.toBlob(ok, "image/jpeg", 0.85));
+        if (job !== drawJob || doc !== data || !blob) return;
+        const url = URL.createObjectURL(blob); previewUrls.push(url);
+        data.pages[i].preview = url;
+        showPreview(i);
+      } catch { /* this page stays as text only */ }
+    }
+  } finally { pdf.destroy(); }
+}
+
+// Put a newly drawn image into the page on screen, without redrawing the editor.
+function showPreview(i) {
+  const el = document.querySelectorAll(".page")[i], url = doc.pages[i].preview;
+  if (!el || !url) return;
+  const ph = el.querySelector(":scope > .no-preview");
+  if (ph) {
+    const img = Object.assign(document.createElement("img"), { alt: `Page ${i + 1}`, src: url });
+    ph.replaceWith(img);
+    el.classList.add("has-preview");
+  }
+  document.querySelectorAll(".addn[data-id]").forEach(b => b._paint?.());   // moved pictures cut from this page
 }
 
 $("#file").addEventListener("change", e => openFile(e.target.files[0]));
@@ -869,11 +955,12 @@ function objPicture(o, Z, at) {
   if (o.action === "replace") {
     box.innerHTML = `<img alt="Replacement image" src="${o.url}">`;
   } else {
-    const prev = doc.pages[o.origPage].preview, pic = document.createElement("div");
-    pic.className = "objpic" + (prev ? "" : " none");
-    if (!prev) pic.textContent = "Image";
+    const pic = document.createElement("div");
     box.appendChild(pic);
-    box._paint = () => {                                           // the picture, cut from the page preview
+    box._paint = () => {          // the picture, cut from the page image (which may still be being drawn)
+      const prev = doc.pages[o.origPage].preview;
+      pic.className = "objpic" + (prev ? "" : " none");
+      pic.textContent = prev ? "" : "Image";
       if (!prev) return;
       const k = (o.rect[2] - o.rect[0]) / (o.bbox[2] - o.bbox[0]);
       Object.assign(pic.style, { backgroundImage: `url("${prev}")`, backgroundSize: `${doc.pages[o.origPage].width * Z * k}px auto`,
