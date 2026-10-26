@@ -296,7 +296,7 @@ class Slicer:
     def _text(self):
         if self._lines is None:
             doc = fitz.open("pdf", self.src_bytes)
-            raw = doc[self.pno].get_text("rawdict")
+            raw = rawdict(doc[self.pno])
             self._lines = [
                 (fitz.Rect(l["bbox"]), abs(l["dir"][0] - 1) < 1e-3,
                  [fitz.Rect(c["bbox"]) for s in l["spans"] for c in s["chars"]])
@@ -519,7 +519,7 @@ def pdf_advances(page, fontname, cache):
     key = ("adv", page.xref, fontname)
     if key not in cache:
         seen = {}
-        raw = page.get_text("rawdict")
+        raw = rawdict(page)
         for b in raw["blocks"]:
             for l in b.get("lines", []):
                 for sp in l["spans"]:
@@ -569,6 +569,76 @@ def write_text(page, x, y, text, style, choice, fc, size=None):
     fontname = use_font(page, choice, style, fc["registered"])
     page.insert_text((x, y), text, fontsize=size or style["size"], fontname=fontname,
                      color=int_to_rgb(style["color"]))
+    if choice["kind"] in ("buf", "file") and fontname == choice["alias"]:
+        used = fc.setdefault("used", {}).setdefault((page.xref, fontname), [choice, set()])
+        used[1].update(text)
+
+
+def rawdict(page, flags=0):
+    """page.get_text("rawdict"), surviving fonts whose glyphs map to invalid characters:
+    MuPDF fails the whole page when it splits such a ligature; keeping ligatures whole avoids that."""
+    try:
+        return page.get_text("rawdict", flags=flags)
+    except (SystemError, ValueError):
+        return page.get_text("rawdict", flags=flags | fitz.TEXT_PRESERVE_LIGATURES)
+
+
+def _tounicode_cmap(mapping):
+    """A ToUnicode CMap for glyph ids -> text (CIDs are glyph ids in fonts inserted by PyMuPDF)."""
+    def hex16(text):                       # UTF-16BE, as hex (surrogate pairs above U+FFFF)
+        return text.encode("utf-16-be").hex()
+    items = sorted(mapping.items())
+    out = ["/CIDInit /ProcSet findresource begin", "12 dict begin", "begincmap",
+           "/CIDSystemInfo <</Registry(Adobe)/Ordering(UCS)/Supplement 0>> def",
+           "/CMapName /Adobe-Identity-UCS def", "/CMapType 2 def",
+           "1 begincodespacerange", "<0000> <FFFF>", "endcodespacerange"]
+    for k in range(0, len(items), 100):
+        chunk = items[k:k + 100]
+        out.append(f"{len(chunk)} beginbfchar")
+        out += [f"<{gid:04x}> <{hex16(text)}>" for gid, text in chunk]
+        out.append("endbfchar")
+    out += ["endcmap", "CMapName currentdict /CMap defineresource pop", "end", "end"]
+    return "\n".join(out).encode()
+
+
+def fix_tounicode(doc, fc):
+    """PyMuPDF labels a glyph shared by several characters with the last one in the font's table,
+    e.g. "(" as U+FD3E: the PDF looks right but its text reads back wrong, and some readers
+    (MuPDF itself) can fail on such pages. Relabel the fonts the engine embedded: the characters
+    actually written win; otherwise the lowest code point (the ordinary character)."""
+    by_font = {}
+    pages = {doc.page_xref(i): i for i in range(doc.page_count)}
+    for (pxref, alias), (choice, chars) in (fc.get("used") or {}).items():
+        if pxref not in pages:
+            continue
+        for f in doc[pages[pxref]].get_fonts(full=True):
+            if f[4] == alias and f[2] == "Type0":
+                entry = by_font.setdefault(f[0], [choice, set()])
+                entry[1] |= chars
+    for fxref, (choice, chars) in by_font.items():
+        try:
+            font = font_obj(choice["kind"], choice["ref"])
+            mapping = {}
+            for cp in font.valid_codepoints():
+                g = font.has_glyph(cp)
+                if g and (g not in mapping or cp < ord(mapping[g])):
+                    mapping[g] = chr(cp)
+            for ch in chars:
+                g = font.has_glyph(ord(ch))
+                if g:
+                    mapping[g] = ch
+            if not mapping:
+                continue
+            key = doc.xref_get_key(fxref, "ToUnicode")
+            if key[0] == "xref":
+                doc.update_stream(int(key[1].split()[0]), _tounicode_cmap(mapping))
+            else:
+                tu = doc.get_new_xref()
+                doc.update_object(tu, "<<>>")
+                doc.update_stream(tu, _tounicode_cmap(mapping))
+                doc.xref_set_key(fxref, "ToUnicode", f"{tu} 0 R")
+        except Exception:
+            pass        # never fail an edit over text labels
 
 
 def new_font_context():
@@ -679,7 +749,7 @@ def extract_lines(page):
     lines = []
     if page.rotation:  # rotated pages are shown but not editable
         return lines
-    raw = page.get_text("rawdict", flags=fitz.TEXT_PRESERVE_WHITESPACE | fitz.TEXT_ACCURATE_BBOXES)
+    raw = rawdict(page, fitz.TEXT_PRESERVE_WHITESPACE | fitz.TEXT_ACCURATE_BBOXES)
     for bno, block in enumerate(raw["blocks"]):
         if block.get("type") != 0:
             continue
@@ -2720,6 +2790,7 @@ def apply_changes(pdf_bytes, info, edits, inserts, additions=(), objects=(), era
 
     place_pictures(doc, pictures, warnings)
     apply_additions(doc, info, additions, fc, warnings)
+    fix_tounicode(doc, fc)
     out = doc.tobytes(garbage=4, deflate=True)
     pages = doc.page_count
     doc.close()
