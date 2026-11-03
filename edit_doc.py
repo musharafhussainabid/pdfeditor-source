@@ -1599,6 +1599,50 @@ def write_line(doc, page, line, text, fc, keep_styles=True):
         x += w * scale
 
 
+STD_FONTS = {"sans": "he", "serif": "ti", "mono": "co"}
+
+
+def _restyle(doc, info, pno, li, text, sty, fc):
+    """Font choice and style for a line restyled from the format bar. Fields missing from `sty`
+    keep the line's own; "font" is the document's font (src = (page, line)) or sans/serif/mono."""
+    line = info["pages"][pno]["lines"][li]
+    bold0, italic0 = _face(line)
+    bold, italic = sty.get("bold", bold0), sty.get("italic", italic0)
+    color = int(sty["color"][1:], 16) if "color" in sty else line["color"]
+    size = sty.get("size", line["size"])
+    font = sty.get("font")
+    if font in STD_FONTS:
+        flags = (16 if bold else 0) | (2 if italic else 0)
+        name = BASE14[STD_FONTS[font]][(int(bold), int(italic))]
+        fallback = default_fallback()
+        if any(ord(c) > 255 for c in text) and fallback:   # the standard fonts only have Latin-1
+            choice = {"font": font_obj("file", fallback), "kind": "file", "ref": fallback, "alias": file_alias(fallback)}
+        else:
+            choice = {"font": font_obj("base14", name), "kind": "base14", "ref": name, "alias": name}
+        return choice, {"font": name, "flags": flags, "size": size, "color": color}
+    src = sty.get("src") or (pno, li)
+    if src == (pno, li) and (bold, italic) == (bold0, italic0):          # same font as before: keep it exactly
+        style = {**_style_of(line), "size": size, "color": color}
+        return choose_font(doc, doc[pno], style, text, fc["cache"]), style
+    choice, style = doc_font_choice(doc, info, src, bold, italic, text, fc)
+    return choice, {**style, "size": size, "color": color}
+
+
+def write_restyled(doc, info, pno, li, text, sty, fc, warnings):
+    """Write a restyled line on its baseline, keeping its alignment; shrink it only if it would
+    run out of its column."""
+    page, line = doc[pno], info["pages"][pno]["lines"][li]
+    choice, style = _restyle(doc, info, pno, li, text, sty, fc)
+    width = choice["font"].text_length(text, fontsize=style["size"])
+    room = _avail(page, line)
+    scale = room / width if width > room > 0 else 1.0
+    scale = max(scale, 4 / style["size"])
+    if scale < 0.98:
+        warnings.append(f"Page {pno + 1}: “{text[:30]}” didn't fit at the chosen size, so it was made smaller.")
+    write_text(page, _place_x(line, width * scale), line["origin"][1], text, style, choice, fc,
+               size=style["size"] * scale)
+
+
 def _fits(doc, page, line, text, fc):
     if "\n" in text:
         return False
@@ -1828,14 +1872,19 @@ def apply_text_edits(doc, info, edits, fc, warnings, growth):
     size, and if it needs more lines than it had, room is made below it (a table
     row grows, content below moves down) via `growth` insertions.
     """
-    per_page = {}
+    per_page, styled_pages = {}, {}
     for e in edits:
         text = "\n".join(part.strip() for part in str(e["text"]).replace("\r", "").split("\n"))
+        if e.get("style"):              # a restyled line stays one line: it is rewritten in place
+            styled_pages.setdefault(int(e["page"]), {})[int(e["line"])] = e["style"]
+            text = " ".join(text.split("\n"))
         per_page.setdefault(int(e["page"]), {})[int(e["line"])] = text.strip(" \t")
     for pno, changed in per_page.items():
         page = doc[pno]
         lines = info["pages"][pno]["lines"]
-        changed = {i: t for i, t in changed.items() if lines[i]["editable"] and t != lines[i]["text"]}
+        styled = styled_pages.get(pno, {})
+        changed = {i: t for i, t in changed.items()
+                   if lines[i]["editable"] and (t != lines[i]["text"] or (i in styled and t))}
         if not changed:
             continue
         redact, writes, done = set(), [], set()
@@ -1846,10 +1895,10 @@ def apply_text_edits(doc, info, edits, fc, warnings, growth):
             done |= set(para)
             texts = [changed.get(j, lines[j]["text"]) for j in para]
             edited = [q for q, j in enumerate(para) if j in changed]
-            if all(_fits(doc, page, lines[para[q]], texts[q], fc) for q in edited):
+            if all(para[q] in styled or _fits(doc, page, lines[para[q]], texts[q], fc) for q in edited):
                 for q in edited:
                     redact.add(para[q])
-                    writes.append((lines[para[q]], texts[q]))
+                    writes.append((para[q], texts[q]))
                 continue
             first = edited[0]
             slots = para[first:]
@@ -1873,12 +1922,16 @@ def apply_text_edits(doc, info, edits, fc, warnings, growth):
                     warnings.append(f"Page {pno + 1}: no room to add lines below “{fit[0][:30]}…”, "
                                     "so the last line was set smaller to fit.")
             for j, t in zip(slots, fit + [""] * (len(slots) - len(fit))):
-                writes.append((lines[j], t))
+                writes.append((j, t))
         if redact:
             _redact_text(page, [fitz.Rect(lines[j]["bbox"]) for j in redact])
-        for line, t in writes:
-            if t:  # empty text = delete the line
-                write_line(doc, page, line, t, fc)
+        for j, t in writes:
+            if not t:   # empty text = delete the line
+                continue
+            if j in styled:
+                write_restyled(doc, info, pno, j, t, styled[j], fc, warnings)
+            else:
+                write_line(doc, page, lines[j], t, fc)
 
 
 def renumber(doc, info, inserts, fc):
@@ -2799,7 +2852,8 @@ def apply_changes(pdf_bytes, info, edits, inserts, additions=(), objects=(), era
     """
     Remove/move/replace existing images and erase areas, apply text edits and list insertions,
     then place additions on top.
-      edits:     [{"page", "line", "text"}]            (text may contain "\n" line breaks)
+      edits:     [{"page", "line", "text", "style"?}]  (text may contain "\n" line breaks; "style"
+                 restyles the whole line: font/src, size, bold, italic, color "#rrggbb", each optional)
       inserts:   [{"page", "list", "after", "items"}]   (items: strings; "-" lines are sub-points)
       additions: see apply_additions;  objects, erase: see apply_objects
     Returns (edited_pdf_bytes, page_count, warnings).

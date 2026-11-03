@@ -86,7 +86,7 @@
       transition:background .12s}
   .page:not(.has-preview) .ln{color:var(--ink)}
   .ln:hover{background:rgba(59,91,219,.10);box-shadow:0 0 0 1px rgba(59,91,219,.25)}
-  .ln:focus,.ln.changed{color:var(--c,#1b2130);background:#fff;box-shadow:0 0 0 1.5px var(--accent)}
+  .ln:focus,.ln.changed{color:var(--c,#1b2130);background:var(--bg,#fff);box-shadow:0 0 0 1.5px var(--accent)}
   .ln.changed:not(:focus){box-shadow:0 0 0 1.5px var(--accent),0 0 0 4px rgba(59,91,219,.15)}
   .ln.empty:not(:focus){background:repeating-linear-gradient(135deg,#fff,#fff 4px,#fdecec 4px,#fdecec 8px);box-shadow:0 0 0 1.5px var(--danger)}
   .add{position:absolute;z-index:3;width:22px;height:22px;padding:0;border-radius:50%;border:1.5px solid var(--accent);color:var(--accent);
@@ -358,6 +358,8 @@ const store = { get: k => { try { return localStorage.getItem(k); } catch { retu
 
 let pdfFile = null, doc = null, zoom = 1, accessCode = "";
 const edits = new Map();     // line id -> new text
+const lineStyles = new Map(); // line id -> its new style from the format bar (font, size, bold, italic, colour)
+let fmtLine = null;          // the line the format bar works on: stays while you use the bar
 const inserts = new Map();   // "listId|itemIndex" -> new points (one per line)
 let added = [];              // new text boxes, images and signatures; rect is in PDF points
 let selectedId = null, addSeq = 0, lastSig = null;
@@ -443,7 +445,8 @@ async function openFile(f) {
       data.pages.forEach((p, i) => { p.preview = withImages.pages[i]?.preview; });
     }
     clearPreviews();
-    doc = data; pdfFile = f; edits.clear(); inserts.clear(); clearAdded(); selectedId = null; setupFonts(); setupImages();
+    doc = data; pdfFile = f; edits.clear(); lineStyles.clear(); fmtLine = null; inserts.clear(); clearAdded(); selectedId = null;
+    bgCanvases.clear(); setupFonts(); setupImages();
     $("#docname").textContent = f.name;
     $("#docpages").textContent = `· ${data.pages.length} page${data.pages.length === 1 ? "" : "s"}`;
     $("#welcome").hidden = true; $("#fmt").hidden = false; $("#viewer").hidden = false; $("#actions").hidden = false; $("#docinfo").hidden = false;
@@ -529,6 +532,7 @@ function showPreview(i) {
     const img = Object.assign(document.createElement("img"), { alt: `Page ${i + 1}`, src: url });
     ph.replaceWith(img);
     el.classList.add("has-preview");
+    el.querySelectorAll(".ln.changed, .ln:focus").forEach(b => b._bg?.());
   }
   document.querySelectorAll(".addn[data-id]").forEach(b => b._paint?.());   // moved pictures cut from this page
 }
@@ -619,21 +623,32 @@ function lineBox(line, Z) {
     left: x0 * Z + "px", top: y0 * Z + "px",
     minWidth: (x1 - x0) * Z + "px", maxWidth: (Math.max(line.maxRight || x1, x1) - x0) * Z + 4 + "px",
     minHeight: (y1 - y0) * Z + "px", lineHeight: (y1 - y0) * Z + "px",
-    font: `${line.italic ? "italic " : ""}${line.bold ? 700 : 400} ${line.size * Z}px ${fontFamily(line.font)}`,
   });
-  box.style.setProperty("--c", line.color || "#000");
+  // While edited, the box hides the page's own text: it takes the colour of the page behind the
+  // line (white text on a dark banner stays readable) and the line's style, or the new one.
+  box._bg = () => lineBackground(box, line);
+  box._restyle = () => {
+    const s = lineStyles.get(line.id);
+    box.style.font = s ? `${s.italic ? "italic " : ""}${s.bold ? 700 : 400} ${s.size * Z}px ${cssFamily(s)}`
+                       : `${line.italic ? "italic " : ""}${line.bold ? 700 : 400} ${line.size * Z}px ${fontFamily(line.font)}`;
+    box.style.setProperty("--c", s ? s.color : line.color || "#000");
+    mark();
+  };
   const mark = () => {
-    box.classList.toggle("changed", edits.has(line.id));
+    const changed = edits.has(line.id) || lineStyles.has(line.id);
+    box.classList.toggle("changed", changed);
     box.classList.toggle("empty", edits.get(line.id) === "");
     box.title = edits.get(line.id) === "" ? "This line will be removed" : "";
+    if (changed) box._bg();
   };
-  mark();
+  box._restyle();
+  box.addEventListener("focus", () => box._bg());
   box.addEventListener("keydown", e => {
     if (e.key === "Enter" && (e.shiftKey || e.ctrlKey || e.metaKey)) {   // new line in the same paragraph
       e.preventDefault(); document.execCommand("insertText", false, "\n"); return;
     }
     if (e.key === "Enter") { e.preventDefault(); box.blur(); }
-    if (e.key === "Escape") { box.textContent = line.text; edits.delete(line.id); mark(); refresh(); box.blur(); }
+    if (e.key === "Escape") { box.textContent = line.text; edits.delete(line.id); lineStyles.delete(line.id); box._restyle(); refresh(); box.blur(); }
   });
   box.addEventListener("paste", e => {                                   // paste as plain text
     e.preventDefault(); document.execCommand("insertText", false, (e.clipboardData.getData("text/plain") || "").replace(/\r/g, ""));
@@ -645,6 +660,48 @@ function lineBox(line, Z) {
   });
   return box;
 }
+
+// The page's colour around a line, read from the drawn page image: the most common colour just
+// outside the line's box. Text that would vanish on it (same colour) gets black or white instead.
+const bgCanvases = new Map();   // page image -> its pixels (a few pages kept)
+async function lineBackground(box, line) {
+  const img = box.closest(".page")?.querySelector(":scope > img");
+  if (!img) return;
+  try {
+    await img.decode();
+    let c = bgCanvases.get(img.src);
+    if (!c) {
+      c = document.createElement("canvas"); c.width = img.naturalWidth; c.height = img.naturalHeight;
+      c.getContext("2d", { willReadFrequently: true }).drawImage(img, 0, 0);
+      bgCanvases.set(img.src, c);
+      if (bgCanvases.size > 4) bgCanvases.delete(bgCanvases.keys().next().value);
+    }
+    const page = doc.pages[+line.id.match(/^p(\d+)-/)[1]], k = c.width / page.width, g = c.getContext("2d");
+    const pad = 2, [x0, y0, x1, y1] = line.bbox.map(v => v * k);
+    const X0 = Math.max(0, Math.floor(x0 - pad * k)), Y0 = Math.max(0, Math.floor(y0 - pad * k));
+    const X1 = Math.min(c.width - 1, Math.ceil(x1 + pad * k)), Y1 = Math.min(c.height - 1, Math.ceil(y1 + pad * k));
+    const counts = new Map();
+    const take = (x, y, w, h) => {
+      if (w < 1 || h < 1) return;
+      const d = g.getImageData(x, y, w, h).data;
+      for (let i = 0; i < d.length; i += 4) {
+        const key = (d[i] >> 4) << 8 | (d[i + 1] >> 4) << 4 | d[i + 2] >> 4;
+        const e = counts.get(key) || [0, 0, 0, 0];
+        e[0]++; e[1] += d[i]; e[2] += d[i + 1]; e[3] += d[i + 2]; counts.set(key, e);
+      }
+    };
+    const t = Math.max(1, Math.round(pad * k * 0.6));     // a thin ring around the line
+    take(X0, Y0, X1 - X0, t); take(X0, Y1 - t, X1 - X0, t); take(X0, Y0, t, Y1 - Y0); take(X1 - t, Y0, t, Y1 - Y0);
+    const [n, r, gr, b] = [...counts.values()].sort((a, b) => b[0] - a[0])[0] || [];
+    if (!n) return;
+    const bg = [r / n, gr / n, b / n].map(Math.round);
+    box.style.setProperty("--bg", `rgb(${bg})`);
+    const s = lineStyles.get(line.id), fg = hexRgb(s ? s.color : line.color || "#000000");
+    const lum = ([R, G, B]) => 0.2126 * R + 0.7152 * G + 0.0722 * B;
+    if (Math.abs(lum(fg) - lum(bg)) < 40) box.style.setProperty("--c", lum(bg) > 128 ? "#000" : "#fff");
+  } catch { /* keep the plain white background */ }
+}
+const hexRgb = h => [1, 3, 5].map(i => parseInt((h || "#000000").slice(i, i + 2), 16) || 0);
 
 // ---------- 3. adding points to lists -----------------------------------------
 function openPop(pageEl, list, item, Z) {
@@ -786,6 +843,7 @@ function select(id) {
   if (selectedId === id) return;
   const prev = added.find(a => a.id === selectedId);
   selectedId = id;
+  if (id) fmtLine = null;
   if (prev && prev.type === "text" && !prev.text.trim()) { removeAdded(prev.id, true); return; }   // empty box: drop it
   document.querySelectorAll(".addn").forEach(b => b.classList.toggle("sel", b.dataset.id === id));
   document.querySelectorAll(".obj").forEach(b => b.classList.toggle("sel", b.dataset.key === id));
@@ -1126,9 +1184,30 @@ function setupFonts() {
                   : { font: "sans", fontFrom: null, size: 12, bold: false, italic: false, color: "#000000" };
 }
 
+// A line's style now: the one chosen in the format bar, or its own.
+const lineStyleOf = l => lineStyles.get(l.id) || styleOfLine(l);
+const STYLE_KEYS = ["font", "fontFrom", "size", "bold", "italic", "color"];
+const sameStyle = (a, b) => STYLE_KEYS.every(k => k === "color" ? a.color.toLowerCase() === b.color.toLowerCase()
+                                                                  : k === "fontFrom" ? a.font !== "doc" || a.fontFrom === b.fontFrom : a[k] === b[k]);
+// What changed, for the server: only those fields, so everything else stays exactly as in the PDF.
+function styleChange(id) {
+  const s = lineStyles.get(id);
+  if (!s) return null;
+  const own = styleOfLine(lineById.get(id)), out = {};
+  if (s.font !== own.font || (s.font === "doc" && s.fontFrom !== own.fontFrom)) {
+    out.font = s.font; if (s.font === "doc") out.fontFrom = s.fontFrom;
+  }
+  if (s.size !== own.size) out.size = s.size;
+  if (s.bold !== own.bold) out.bold = s.bold;
+  if (s.italic !== own.italic) out.italic = s.italic;
+  if (s.color.toLowerCase() !== own.color.toLowerCase()) out.color = s.color;
+  return Object.keys(out).length ? out : null;
+}
+
 function fmtState() {
   const ln = document.activeElement?.closest?.(".ln");
-  if (ln && lineById.has(ln.dataset.id)) return { kind: "line", line: lineById.get(ln.dataset.id) };
+  if (ln && lineById.has(ln.dataset.id)) fmtLine = ln.dataset.id;
+  if (fmtLine && !selectedId && lineById.has(fmtLine)) return { kind: "line", line: lineById.get(fmtLine) };
   const a = added.find(x => x.id === selectedId) || erases.find(x => x.id === selectedId)
          || (imgById.has(selectedId) ? { type: "image" } : null);
   if (a) return { kind: a.type === "text" ? "box" : "other", a };
@@ -1140,15 +1219,15 @@ function updateFmt() {
   const st = fmtState();
   let s = newStyle, label = "New text", note = "Click any text in the document to see its font and size";
   if (st.kind === "line") {
-    s = newStyle = styleOfLine(st.line);                  // like Word's format painter: new text boxes match
-    label = "Selected text"; note = "New text boxes will use this style";
+    s = lineStyleOf(st.line); newStyle = { ...s };        // like Word's format painter: new text boxes match
+    label = "Selected text"; note = "Changes apply to the whole line";
   } else if (st.kind === "box") { s = st.a; label = "Text box"; note = ""; }
   else if (st.kind === "other") {
     label = st.a.type === "image" ? "Image" : st.a.type === "erase" ? "Erase area" : "Signature"; note = "Select text to see its style";
   }
   const bar = $("#fmt");
-  bar.classList.toggle("ro", st.kind === "line"); bar.classList.toggle("off", st.kind === "other");
-  bar.querySelectorAll("select, input").forEach(c => c.disabled = st.kind === "line" || st.kind === "other");
+  bar.classList.toggle("off", st.kind === "other");
+  bar.querySelectorAll("select, input").forEach(c => c.disabled = st.kind === "other");
   $("#fmtLabel").textContent = label; $("#fmtNote").textContent = note;
   $("#fFont").value = s.font === "doc" ? "doc:" + s.fontFrom : s.font;
   $("#fSize").value = s.size;
@@ -1158,7 +1237,14 @@ function updateFmt() {
 
 function fmtApply(change) {
   const st = fmtState();
-  if (st.kind === "line" || st.kind === "other") return;
+  if (st.kind === "other") return;
+  if (st.kind === "line") {                               // restyle a line of the document
+    const l = st.line, s = { ...lineStyleOf(l), ...change };
+    if (sameStyle(s, styleOfLine(l))) lineStyles.delete(l.id); else lineStyles.set(l.id, s);
+    document.querySelector(`.ln[data-id="${l.id}"]`)?._restyle();
+    refresh(); updateFmt();
+    return;
+  }
   Object.assign(st.kind === "box" ? st.a : newStyle, change);
   if (st.kind === "box") {
     const box = document.querySelector(`.addn[data-id="${st.a.id}"]`);
@@ -1173,6 +1259,10 @@ $("#fBold").onclick = () => fmtApply({ bold: $("#fBold").getAttribute("aria-pres
 $("#fItalic").onclick = () => fmtApply({ italic: $("#fItalic").getAttribute("aria-pressed") !== "true" });
 $("#fColor").addEventListener("input", e => fmtApply({ color: e.target.value }));
 $("#fmt").addEventListener("mousedown", e => { if (e.target.closest("button")) e.preventDefault(); });   // keep typing in the box
+// Using the bar keeps the line it works on; clicking anywhere else lets go of it.
+document.addEventListener("pointerdown", e => {
+  if (fmtLine && !e.target.closest(".fmt, .ln")) { fmtLine = null; setTimeout(updateFmt); }
+}, true);
 document.addEventListener("focusin", updateFmt);
 document.addEventListener("focusout", () => setTimeout(updateFmt));
 
@@ -1233,7 +1323,8 @@ function placeSignature(sig) {
 }
 
 // ---------- toolbar -----------------------------------------------------------
-const pending = () => edits.size + inserts.size + added.length + objs.size + erases.length;
+const changedLines = () => [...new Set([...edits.keys(), ...lineStyles.keys()])];
+const pending = () => changedLines().length + inserts.size + added.length + objs.size + erases.length;
 function refresh() {
   const n = pending();
   $("#save").disabled = !n; $("#discard").disabled = !n;
@@ -1249,11 +1340,11 @@ $("#zoomIn").onclick = () => setZoom(ZOOMS.find(z => z > zoom + 0.01) || 2);
 $("#zoomOut").onclick = () => setZoom([...ZOOMS].reverse().find(z => z < zoom - 0.01) || 0.5);
 
 $("#discard").onclick = () => {
-  const saved = [new Map(edits), new Map(inserts), added, new Map(objs), erases];
-  edits.clear(); inserts.clear(); added = []; objs.clear(); erases = []; selectedId = null; render(); refresh();
+  const saved = [new Map(edits), new Map(inserts), added, new Map(objs), erases, new Map(lineStyles)];
+  edits.clear(); lineStyles.clear(); inserts.clear(); added = []; objs.clear(); erases = []; selectedId = null; render(); refresh();
   toast("All changes discarded.", { action: "Undo", onAction: () => {
     saved[0].forEach((v, k) => edits.set(k, v)); saved[1].forEach((v, k) => inserts.set(k, v)); added = saved[2];
-    saved[3].forEach((v, k) => objs.set(k, v)); erases = saved[4]; render(); refresh();
+    saved[3].forEach((v, k) => objs.set(k, v)); erases = saved[4]; saved[5].forEach((v, k) => lineStyles.set(k, v)); render(); refresh();
   }});
 };
 function confirmDiscard() {
@@ -1283,7 +1374,10 @@ $("#save").addEventListener("click", async () => {
   document.activeElement?.blur?.();
   const r2 = v => Math.round(v * 100) / 100;
   const body = {
-    edits: [...edits].map(([lineId, text]) => ({ lineId, text })),
+    edits: changedLines().map(lineId => {
+      const e = { lineId, text: edits.has(lineId) ? edits.get(lineId) : lineById.get(lineId).text }, style = styleChange(lineId);
+      return style ? { ...e, style } : e;
+    }),
     inserts: [...inserts].map(([key, text]) => {
       const [listId, afterItem] = key.split("|");
       return { listId, afterItem: +afterItem, items: points(text) };

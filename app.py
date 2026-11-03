@@ -301,6 +301,38 @@ def read_objects(raw, raw_erase, files, pages):
     return objects, erase
 
 
+def read_style(raw, where, pages):
+    """Check an edit's optional "style" (the format bar on an existing line). Every field is optional;
+    a missing one keeps the line's own: {"font": doc|sans|serif|mono, "fontFrom", "size", "bold", "italic", "color"}."""
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise HTTPException(400, f"{where}: style must be an object.")
+    out = {}
+    if "size" in raw:
+        if not isinstance(raw["size"], (int, float)) or isinstance(raw["size"], bool) or not 4 <= raw["size"] <= 96:
+            raise HTTPException(400, f"{where}: size must be between 4 and 96.")
+        out["size"] = float(raw["size"])
+    if "color" in raw:
+        if not isinstance(raw["color"], str) or not HEX_COLOR.fullmatch(raw["color"]):
+            raise HTTPException(400, f"{where}: color must look like #1a2b3c.")
+        out["color"] = raw["color"]
+    for k in ("bold", "italic"):
+        if k in raw:
+            out[k] = bool(raw[k])
+    if "font" in raw:
+        font = raw["font"]
+        if font == "doc":
+            m = re.fullmatch(r"p(\d+)-l(\d+)", str(raw.get("fontFrom", "")))
+            if not m or int(m[1]) >= len(pages) or int(m[2]) >= len(pages[int(m[1])]["lines"]):
+                raise HTTPException(400, f"{where}: font 'doc' needs fontFrom, the lineId to take the font from.")
+            out["src"] = (int(m[1]), int(m[2]))
+        elif font not in ("sans", "serif", "mono"):
+            raise HTTPException(400, f"{where}: font must be doc, sans, serif or mono.")
+        out["font"] = font
+    return out or None
+
+
 def read_additions(raw, files, pages):
     """Check the "additions" list and attach each image's bytes (an addition's imageId is a file name)."""
     if not isinstance(raw, list) or len(raw) > MAX_ADDITIONS:
@@ -348,11 +380,13 @@ def read_additions(raw, files, pages):
 async def edit(request: Request, file: UploadFile = File(...), changes: str = Form(...),
                images: list[UploadFile] = File(default=[]), x_api_key: str = Header(default="")):
     """Apply changes to the PDF and return the edited file.
-    changes = {"edits": [{"lineId", "text"}], "inserts": [{"listId", "afterItem", "items"}],
+    changes = {"edits": [{"lineId", "text", "style"?}], "inserts": [{"listId", "afterItem", "items"}],
                "additions": [{"type": "text"|"image"|"signature", "page", "rect", ...}],
                "objects": [{"id": "p0-i2", "action": "remove"|"move"|"replace", "allPages", "page", "rect", "imageId"}],
                "erase": [{"page", "rect", "text": false}]}
     A text addition with "font": "doc" and "fontFrom": "<lineId>" is written in that line's own font.
+    An edit's optional "style" restyles the whole line: {"font", "fontFrom", "size", "bold", "italic", "color"},
+    each optional (missing = the line's own).
     images  = the PNG/JPEG files that additions and replacements point to (by file name)."""
     check_key(x_api_key)
     check_rate(request)
@@ -395,7 +429,8 @@ def _edit(data, changes, files):
         m = re.fullmatch(r"p(\d+)-l(\d+)", str(e.get("lineId", "")))
         if not m or int(m[1]) >= len(pages) or int(m[2]) >= len(pages[int(m[1])]["lines"]):
             raise HTTPException(400, f"Unknown lineId {e.get('lineId')}")
-        edits.append({"page": int(m[1]), "line": int(m[2]), "text": str(e.get("text", ""))})
+        edits.append({"page": int(m[1]), "line": int(m[2]), "text": str(e.get("text", "")),
+                      "style": read_style(e.get("style"), f"edit {e.get('lineId')}", pages)})
     for ins in body.get("inserts") or []:
         ins = ins if isinstance(ins, dict) else {}
         m = re.fullmatch(r"p(\d+)-L(\d+)", str(ins.get("listId", "")))
