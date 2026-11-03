@@ -183,6 +183,11 @@
   .fcolor b{font-size:15px;line-height:1;margin-top:-4px}
   .fcolor i{position:absolute;left:7px;right:7px;bottom:6px;height:4px;border-radius:2px;background:var(--swatch,#000);box-shadow:0 0 0 1px rgba(0,0,0,.12)}
   .fcolor input{position:absolute;inset:0;opacity:0;cursor:pointer;width:100%;height:100%;border:0;padding:0}
+  .fapply{height:32px;flex:none;margin-left:4px;padding:0 14px;border:0;border-radius:7px;background:var(--accent);color:#fff;
+          font:inherit;font-size:14px;font-weight:600;cursor:pointer}
+  .fapply:hover:not(:disabled){filter:brightness(1.08)}
+  .fapply:disabled{opacity:.4;cursor:default}
+  .fapply.done{background:#2f9e44}
   .fsep{width:1px;height:22px;background:var(--line);margin:0 4px;flex:none}
   .fmt-note{margin-left:8px;font-size:13px;color:var(--muted);white-space:nowrap}
   .fmt.ro select,.fmt.ro .fmt-size,.fmt.ro .fbtn,.fmt.ro .fcolor{pointer-events:none}
@@ -216,6 +221,12 @@
     .addgroup{gap:3px;padding-right:5px}
     .addgroup .btn,#openAnother{padding:0 8px}
     #save{padding:0 10px}
+    .fmt{padding:0 8px;gap:4px}
+    .fmt select{width:104px}
+    .fmt-size input{width:40px;padding-left:6px}
+    .fsep{display:none}
+    .fbtn,.fcolor{width:30px}
+    .fapply{padding:0 10px;margin-left:2px}
   }
 </style>
 </head>
@@ -273,6 +284,7 @@
   <button class="fbtn" id="fBold" title="Bold" aria-label="Bold" aria-pressed="false"><b>B</b></button>
   <button class="fbtn" id="fItalic" title="Italic" aria-label="Italic" aria-pressed="false"><i style="font-family:Georgia,serif">I</i></button>
   <label class="fcolor" id="fColorWrap" title="Text colour"><b>A</b><i></i><input type="color" id="fColor" aria-label="Text colour"></label>
+  <button class="fapply" id="fApply" title="Apply this style to the selected text" disabled>Apply</button>
   <span class="fmt-note" id="fmtNote"></span>
 </div>
 
@@ -1228,6 +1240,8 @@ function updateFmt() {
   const bar = $("#fmt");
   bar.classList.toggle("off", st.kind === "other");
   bar.querySelectorAll("select, input").forEach(c => c.disabled = st.kind === "other");
+  $("#fApply").disabled = st.kind !== "line" && st.kind !== "box";
+  if (st.kind === "new") note = "Click text in the document, then change its style and press Apply";
   $("#fmtLabel").textContent = label; $("#fmtNote").textContent = note;
   $("#fFont").value = s.font === "doc" ? "doc:" + s.fontFrom : s.font;
   $("#fSize").value = s.size;
@@ -1258,6 +1272,16 @@ $("#fSize").addEventListener("input", e => { const v = +e.target.value; if (v >=
 $("#fBold").onclick = () => fmtApply({ bold: $("#fBold").getAttribute("aria-pressed") !== "true" });
 $("#fItalic").onclick = () => fmtApply({ italic: $("#fItalic").getAttribute("aria-pressed") !== "true" });
 $("#fColor").addEventListener("input", e => fmtApply({ color: e.target.value }));
+// Apply: everything the bar shows goes onto the selected text (the controls also apply as you change them).
+let applyTimer;
+$("#fApply").onclick = () => {
+  const v = $("#fFont").value, size = half(clamp(+$("#fSize").value || 12, 4, 96));
+  fmtApply({ ...(v.startsWith("doc:") ? { font: "doc", fontFrom: v.slice(4) } : { font: v, fontFrom: null }), size,
+             bold: $("#fBold").getAttribute("aria-pressed") === "true", italic: $("#fItalic").getAttribute("aria-pressed") === "true",
+             color: $("#fColor").value });
+  const b = $("#fApply"); b.textContent = "Applied ✓"; b.classList.add("done");
+  clearTimeout(applyTimer); applyTimer = setTimeout(() => { b.textContent = "Apply"; b.classList.remove("done"); }, 1200);
+};
 $("#fmt").addEventListener("mousedown", e => { if (e.target.closest("button")) e.preventDefault(); });   // keep typing in the box
 // Using the bar keeps the line it works on; clicking anywhere else lets go of it.
 document.addEventListener("pointerdown", e => {
