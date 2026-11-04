@@ -9,7 +9,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-COPY edit_doc.py app.py index.html ./
+# Emoji pictures (Twemoji 15.0, pinned and checksum-checked): emoji in edited text are drawn in colour
+COPY tools/get_emoji.py /tmp/get_emoji.py
+RUN python /tmp/get_emoji.py /app/emoji && rm /tmp/get_emoji.py
+COPY edit_doc.py emoji_support.py app.py index.html ./
 # Run as an unprivileged user, not root
 RUN useradd --system --uid 10001 --no-create-home app
 USER app

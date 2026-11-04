@@ -17,6 +17,8 @@ from statistics import median
 
 import pymupdf as fitz
 
+import emoji_support as em
+
 EPS = 0.05
 FALLBACK_FONT = os.environ.get("FALLBACK_FONT")  # optional Unicode TTF/OTF for any script
 
@@ -378,7 +380,7 @@ def load_embedded_font(doc, page, basefont):
         try:
             _n, _e, _t, buf = doc.extract_font(xref)
             if buf:
-                return {"buf": buf, "font": fitz.Font(fontbuffer=buf), "alias": f"E{xref}"}
+                return {"buf": buf, "font": em.EmojiFont(fitz.Font(fontbuffer=buf)), "alias": f"E{xref}"}
         except Exception:
             pass
     return None
@@ -467,11 +469,12 @@ def font_obj(kind, ref):
     key = (kind, ref if kind != "buf" else zlib.crc32(ref))
     if key not in _font_objs:
         if kind == "buf":
-            _font_objs[key] = fitz.Font(fontbuffer=ref)
+            f = fitz.Font(fontbuffer=ref)
         elif kind == "file":
-            _font_objs[key] = fitz.Font(fontfile=ref)
+            f = fitz.Font(fontfile=ref)
         else:
-            _font_objs[key] = fitz.Font(ref)
+            f = fitz.Font(ref)
+        _font_objs[key] = em.EmojiFont(f)      # emoji are drawn as pictures: measured, not looked up
     return _font_objs[key]
 
 
@@ -487,7 +490,7 @@ def choose_font(doc, font_page, style, text, cache):
       3. the closest standard PDF font, for plain Latin-1 text
       4. a Unicode fallback font (FALLBACK_FONT, or Arial / DejaVu / Noto if installed)
     """
-    needed = [ord(c) for c in text if not c.isspace()]
+    needed = [ord(c) for c in em.strip(text) if not c.isspace()]
 
     def covers(f):
         return all(f.has_glyph(c) for c in needed)
@@ -566,8 +569,22 @@ def use_font(page, choice, style, registered):
 
 
 def write_text(page, x, y, text, style, choice, fc, size=None):
+    """Write text on a baseline; emoji in it are drawn as colour pictures in line with the letters."""
+    size = size or style["size"]
+    if em.has_emoji(text):
+        for t, is_emoji in em.split(text):
+            if is_emoji:
+                x += em.draw(page, x, y, t, size, fc)
+            elif t:
+                _write_plain(page, x, y, t, style, choice, fc, size)
+                x += choice["font"].text_length(t, fontsize=size)
+        return
+    _write_plain(page, x, y, text, style, choice, fc, size)
+
+
+def _write_plain(page, x, y, text, style, choice, fc, size):
     fontname = use_font(page, choice, style, fc["registered"])
-    page.insert_text((x, y), text, fontsize=size or style["size"], fontname=fontname,
+    page.insert_text((x, y), text, fontsize=size, fontname=fontname,
                      color=int_to_rgb(style["color"]))
     if choice["kind"] in ("buf", "file") and fontname == choice["alias"]:
         used = fc.setdefault("used", {}).setdefault((page.xref, fontname), [choice, set()])
@@ -750,21 +767,80 @@ def extract_lines(page):
     if page.rotation:  # rotated pages are shown but not editable
         return lines
     raw = rawdict(page, fitz.TEXT_PRESERVE_WHITESPACE | fitz.TEXT_ACCURATE_BBOXES)
+    rows = []
     for bno, block in enumerate(raw["blocks"]):
         if block.get("type") != 0:
             continue
         for line in block["lines"]:
             allchars = [(ch["c"], ch["bbox"], ch["origin"], s)
                         for s in line["spans"] for ch in s["chars"]]
-            if not any(not c[0].isspace() for c in allchars):
-                continue
             horizontal = abs(line["dir"][0] - 1) < 1e-3 and abs(line["dir"][1]) < 1e-3
-            size0 = max(s["size"] for s in line["spans"])
-            for chars in (_segments(allchars, size0) if horizontal else [allchars]):
-                entry = _line_entry(chars, horizontal, bno)
-                if entry:
-                    lines.append(entry)
+            rows.append((bno, line, allchars, horizontal))
+    _emoji_into_lines(page, rows)        # emoji the editor drew come back as characters of their line
+    for bno, line, allchars, horizontal in rows:
+        if not any(not c[0].isspace() for c in allchars):
+            continue
+        size0 = max(s["size"] for s in line["spans"])
+        for chars in (_segments(allchars, size0) if horizontal else [allchars]):
+            entry = _line_entry(chars, horizontal, bno)
+            if entry:
+                lines.append(entry)
     return lines
+
+
+def _emoji_into_lines(page, rows):
+    """Emoji the editor drew (pictures) go back into their line as characters, where they sit."""
+    with_emoji = set()
+    for cluster, r, _xref in em.page_emoji(page):
+        cx, cy = (r.x0 + r.x1) / 2, (r.y0 + r.y1) / 2
+        best = None
+        for row in rows:
+            chars = [c for c in row[2] if not c[0].isspace()]
+            if not row[3] or not chars:
+                continue
+            size = max(c[3]["size"] for c in chars)
+            base = chars[0][2][1]
+            if not base - 1.2 * size <= cy <= base + 0.4 * size:
+                continue
+            x0, x1 = min(c[1][0] for c in chars), max(c[1][2] for c in chars)
+            d = 0 if x0 <= cx <= x1 else min(abs(cx - x0), abs(cx - x1))
+            if d <= 3 * size and (best is None or d < best[0]):
+                best = (d, row)
+        if best:
+            chars = best[1][2]
+            k = next((i for i, c in enumerate(chars) if (c[1][0] + c[1][2]) / 2 > cx), len(chars))
+            ref = next((c for c in reversed(chars[:k]) if not c[0].isspace()), None) or \
+                next(c for c in chars if not c[0].isspace())
+            pad = (em.ADVANCE - em.BOX) / 2 * ref[3]["size"]
+            chars.insert(k, (cluster, (r.x0, r.y0, r.x1, r.y1), (r.x0 - pad, ref[2][1]), ref[3]))
+            with_emoji.add(id(best[1]))
+    # Text on both sides of an emoji was written as separate pieces: join them into one line again
+    # (only where an emoji sits in between, so other PDFs read exactly as before).
+    joined = True
+    while joined:
+        joined = False
+        for a in rows:
+            if id(a) not in with_emoji or not a[3]:
+                continue
+            ca = [c for c in a[2] if not c[0].isspace()]
+            if not ca:
+                continue
+            size, base = max(c[3]["size"] for c in ca), ca[0][2][1]
+            ax0, ax1 = min(c[1][0] for c in ca), max(c[1][2] for c in ca)
+            for b in rows:
+                cb = [c for c in b[2] if not c[0].isspace()]
+                if b is a or not b[3] or not cb or abs(cb[0][2][1] - base) > 0.3 * size:
+                    continue
+                bx0, bx1 = min(c[1][0] for c in cb), max(c[1][2] for c in cb)
+                gap = bx0 - ax1 if bx0 >= ax0 else ax0 - bx1
+                if -1 <= gap <= CELL_GAP * size:
+                    a[2][:] = sorted(a[2] + b[2], key=lambda c: c[1][0])
+                    a[1]["spans"] = a[1]["spans"] + b[1]["spans"]
+                    rows.remove(b)
+                    joined = True
+                    break
+            if joined:
+                break
 
 
 def _line_entry(chars, horizontal, bno):
@@ -1602,6 +1678,18 @@ def write_line(doc, page, line, text, fc, keep_styles=True):
 STD_FONTS = {"sans": "he", "serif": "ti", "mono": "co"}
 
 
+def std_font(kind, bold, italic, text):
+    """Helvetica / Times / Courier for sans / serif / mono; a Unicode font if the text needs more than Latin-1."""
+    flags = (16 if bold else 0) | (2 if italic else 0)
+    name = BASE14[STD_FONTS.get(kind, "he")][(int(bold), int(italic))]
+    fallback = default_fallback()
+    if any(ord(c) > 255 for c in em.strip(text)) and fallback:   # the standard fonts only have Latin-1
+        choice = {"font": font_obj("file", fallback), "kind": "file", "ref": fallback, "alias": file_alias(fallback)}
+    else:
+        choice = {"font": font_obj("base14", name), "kind": "base14", "ref": name, "alias": name}
+    return choice, {"font": name, "flags": flags}
+
+
 def _restyle(doc, info, pno, li, text, sty, fc):
     """Font choice and style for a line restyled from the format bar. Fields missing from `sty`
     keep the line's own; "font" is the document's font (src = (page, line)) or sans/serif/mono."""
@@ -1612,14 +1700,8 @@ def _restyle(doc, info, pno, li, text, sty, fc):
     size = sty.get("size", line["size"])
     font = sty.get("font")
     if font in STD_FONTS:
-        flags = (16 if bold else 0) | (2 if italic else 0)
-        name = BASE14[STD_FONTS[font]][(int(bold), int(italic))]
-        fallback = default_fallback()
-        if any(ord(c) > 255 for c in text) and fallback:   # the standard fonts only have Latin-1
-            choice = {"font": font_obj("file", fallback), "kind": "file", "ref": fallback, "alias": file_alias(fallback)}
-        else:
-            choice = {"font": font_obj("base14", name), "kind": "base14", "ref": name, "alias": name}
-        return choice, {"font": name, "flags": flags, "size": size, "color": color}
+        choice, style = std_font(font, bold, italic, text)
+        return choice, {**style, "size": size, "color": color}
     src = sty.get("src") or (pno, li)
     if src == (pno, li) and (bold, italic) == (bold0, italic0):          # same font as before: keep it exactly
         style = {**_style_of(line), "size": size, "color": color}
@@ -1925,6 +2007,7 @@ def apply_text_edits(doc, info, edits, fc, warnings, growth):
                 writes.append((j, t))
         if redact:
             _redact_text(page, [fitz.Rect(lines[j]["bbox"]) for j in redact])
+            em.delete_in(page, [lines[j]["bbox"] for j in redact])
         for j, t in writes:
             if not t:   # empty text = delete the line
                 continue
@@ -2617,7 +2700,10 @@ def doc_font_choice(doc, info, src, bold, italic, text, fc):
 def _doc_text(doc, info, page, rect, a, fc, warnings):
     """Write a text box in the document's own font, wrapped like the editor preview
     (CSS line-height 1.2), shrinking the text only if it would run off the page."""
-    choice, style = doc_font_choice(doc, info, a["src"], a["bold"], a["italic"], a["text"], fc)
+    if a.get("font") == "doc":
+        choice, style = doc_font_choice(doc, info, a["src"], a["bold"], a["italic"], a["text"], fc)
+    else:
+        choice, style = std_font(a.get("font"), a["bold"], a["italic"], a["text"])
     style = {**style, "color": int(a["color"][1:], 16)}
     font, size = choice["font"], a["size"]
     asc, desc = font.ascender, font.descender
@@ -2664,7 +2750,7 @@ def apply_additions(doc, info, additions, fc, warnings):
         if rect.is_empty or rect.width < 2 or rect.height < 2:
             warnings.append(f"Page {a['page'] + 1}: something added outside the page was skipped.")
             continue
-        if a["type"] == "text" and a.get("font") == "doc":
+        if a["type"] == "text" and (a.get("font") == "doc" or em.has_emoji(a["text"])):
             _doc_text(doc, info, page, rect, a, fc, warnings)
         elif a["type"] == "text":
             body = "<br>".join(html.escape(s) for s in a["text"].split("\n"))
@@ -2703,6 +2789,8 @@ def page_images(page):
         return []
     area, out = page.rect.get_area(), []
     for im in page.get_image_info(xrefs=True):
+        if em.cluster_of(page.parent, int(im.get("xref") or 0)):
+            continue                     # an emoji the editor drew: part of its line
         r = fitz.Rect(im["bbox"]) & page.rect
         if r.is_empty or r.width < 3 or r.height < 3:
             continue

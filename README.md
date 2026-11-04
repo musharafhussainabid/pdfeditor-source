@@ -18,6 +18,7 @@ requirements.txt  exact dependency versions
 ## Run it
 ```bash
 pip install -r requirements.txt
+python tools/get_emoji.py            # once: the emoji pictures (8 MB) into ./emoji
 uvicorn app:app --port 8080          # then open http://localhost:8080
 ```
 Or with Docker:
@@ -66,3 +67,5 @@ It is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; 
 implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See [LICENSE](LICENSE).
 
 Uses [PyMuPDF](https://pymupdf.readthedocs.io) © Artifex Software, Inc. (AGPL-3.0).
+Emoji graphics: [Twemoji](https://github.com/jdecked/twemoji) © Twitter/X and contributors, licensed under
+[CC-BY 4.0](https://creativecommons.org/licenses/by/4.0/) (fetched at build time by `tools/get_emoji.py`).
