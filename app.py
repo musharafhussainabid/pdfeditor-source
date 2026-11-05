@@ -32,8 +32,10 @@ from contextlib import asynccontextmanager
 from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
 
-MAX_MB = float(os.environ.get("MAX_FILE_MB", "30"))       # Cloud Run accepts up to 32 MiB per request
-MAX_PAGES = int(os.environ.get("MAX_PAGES", "200"))
+# File limits; 0 = no limit (the default). Very large files take longer and use more memory.
+MAX_MB = float(os.environ.get("MAX_FILE_MB", "0"))
+MAX_PAGES = int(os.environ.get("MAX_PAGES", "0"))
+MAX_IMAGE_MB = float(os.environ.get("MAX_IMAGE_MB", "0"))
 PREVIEW_PAGES = int(os.environ.get("PREVIEW_PAGES", "20"))
 API_KEY = os.environ.get("API_KEY", "")                   # optional: if set, callers must send X-Api-Key
 ALLOWED_ORIGINS = os.environ.get("ALLOWED_ORIGINS", "*")
@@ -46,7 +48,7 @@ ENGINES = max(1, int(os.environ.get("WORKERS", "1")))
 _pool = None
 
 
-JOB_TIMEOUT = 110          # seconds; answer before the proxy in front gives up (120 s)
+JOB_TIMEOUT = float(os.environ.get("JOB_TIMEOUT", "90"))   # seconds a request may take (the proxy allows 120 s)
 
 
 def engine_pool():
@@ -88,7 +90,7 @@ async def engine(fn, *args):
     """Run PDF work off the web process: in a thread for a single engine, else in the engine pool."""
     try:
         if ENGINES == 1:
-            return await run_in_threadpool(fn, *args)
+            return await asyncio.wait_for(run_in_threadpool(fn, *args), JOB_TIMEOUT)
         fut = asyncio.get_running_loop().run_in_executor(engine_pool(), fn, *args)
         return await asyncio.wait_for(fut, JOB_TIMEOUT)
     except RequestError as exc:
@@ -201,7 +203,7 @@ def check_rate(request):
 
 async def read_pdf(file):
     data = await file.read()
-    if len(data) > MAX_MB * 1024 * 1024:
+    if MAX_MB and len(data) > MAX_MB * 1024 * 1024:
         raise HTTPException(413, f"PDFs up to {MAX_MB:g} MB.")
     return data
 
@@ -209,7 +211,7 @@ async def read_pdf(file):
 def analysis(data, detail_pages=None):
     """The engine's analysis (runs in an engine process)."""
     try:
-        return edit_doc.analyze(data, max_pages=MAX_PAGES, detail_pages=detail_pages)
+        return edit_doc.analyze(data, max_pages=MAX_PAGES or None, detail_pages=detail_pages)
     except edit_doc.PdfRejected as exc:
         raise RequestError(422, {"code": exc.code, "message": str(exc)})
 
@@ -237,7 +239,6 @@ async def analyze(request: Request, file: UploadFile = File(...), previews: bool
 
 
 MAX_ADDITIONS = 50
-MAX_IMAGE_MB = 10
 MAX_OBJECTS = 200          # existing images changed in one save
 MAX_ERASE = 50
 HEX_COLOR = re.compile(r"#[0-9a-fA-F]{6}")
@@ -248,7 +249,7 @@ async def read_images(images):
     files = {}
     for f in images or []:
         blob = await f.read()
-        if len(blob) > MAX_IMAGE_MB * 1024 * 1024:
+        if MAX_IMAGE_MB and len(blob) > MAX_IMAGE_MB * 1024 * 1024:
             raise HTTPException(413, f"Images up to {MAX_IMAGE_MB} MB.")
         if not (blob.startswith(b"\x89PNG\r\n\x1a\n") or blob.startswith(b"\xff\xd8\xff")):
             raise HTTPException(400, f"Image {f.filename!r} must be a PNG or JPEG.")

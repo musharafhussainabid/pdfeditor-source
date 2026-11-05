@@ -405,8 +405,11 @@ async function call(path, form) {
   for (;;) {
     let res;
     try {
-      res = await fetch(API + path, { method: "POST", body: form, headers: accessCode ? { "X-Api-Key": accessCode } : {} });
-    } catch {
+      res = await fetch(API + path, { method: "POST", body: form, headers: accessCode ? { "X-Api-Key": accessCode } : {},
+                                      signal: AbortSignal.timeout(90000) });            // wait up to 90 s
+    } catch (e) {
+      if (e.name === "TimeoutError")
+        throw new Error("This is taking longer than 90 seconds. Please try again in a moment.");
       throw new Error("Can't reach the editor right now. Check your connection and try again.");
     }
     if (res.status === 401) {                     // private deployment: ask for the access code once
