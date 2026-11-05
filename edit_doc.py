@@ -851,36 +851,55 @@ def extract_lines(page):
 def _join_rtl_rows(rows):
     """MuPDF splits a right-to-left line where English words or numbers sit in it, and a Bengali or Hindi line
     after some joined letters: join the pieces on one baseline again (only where such scripts are involved,
-    so other PDFs read exactly as before)."""
-    def info(row):
+    so other PDFs read exactly as before). Each piece is measured once and compared only with its
+    neighbours on the same baseline (a 300-page Urdu book took minutes otherwise)."""
+    info = {}
+    for k, row in enumerate(rows):
         cs = [c for c in row[2] if not c[0].isspace()]
         if not row[3] or not cs:
-            return None
-        return (max(c[3]["size"] for c in cs), median(c[2][1] for c in cs),
-                min(c[1][0] for c in cs), max(c[1][2] for c in cs),
-                any(sh.is_shaped_char(ch) for c in cs for ch in c[0]),
-                any(sh.is_indic(ch) for c in cs for ch in c[0]))
-    joined = True
-    while joined:
-        joined = False
-        for a in rows:
-            ia = info(a)
-            if not ia:
-                continue
-            for b in rows:
-                ib = info(b) if b is not a else None
-                if not ib or not (ia[4] or ib[4]) or abs(ia[1] - ib[1]) > 0.3 * max(ia[0], ib[0]):
-                    continue
-                gap = max(ib[2] - ia[3], ia[2] - ib[3])
+            continue
+        text = "".join(c[0] for c in cs)
+        info[id(row)] = {"k": k, "size": max(c[3]["size"] for c in cs), "base": median(c[2][1] for c in cs),
+                         "x0": min(c[1][0] for c in cs), "x1": max(c[1][2] for c in cs),
+                         "shaped": any(sh.is_shaped_char(ch) for ch in text), "indic": any(sh.is_indic(ch) for ch in text)}
+    if not any(i["shaped"] for i in info.values()):
+        return
+    pieces = sorted((r for r in rows if id(r) in info), key=lambda r: info[id(r)]["base"])
+    groups, cur = [], []
+    for r in pieces:                                    # pieces on (about) one baseline
+        if cur and abs(info[id(r)]["base"] - info[id(cur[0])]["base"]) > 0.3 * info[id(cur[0])]["size"]:
+            groups.append(cur)
+            cur = []
+        cur.append(r)
+    if cur:
+        groups.append(cur)
+    gone = set()
+    for g in groups:
+        g.sort(key=lambda r: info[id(r)]["x0"])
+        chain = [g[0]]
+        for r in g[1:] + [None]:
+            a = info[id(chain[-1])] if chain else None
+            if r is not None:
+                b = info[id(r)]
+                last = {"x1": max(info[id(c)]["x1"] for c in chain), "size": max(info[id(c)]["size"] for c in chain),
+                        "shaped": any(info[id(c)]["shaped"] for c in chain), "indic": all(info[id(c)]["indic"] for c in chain)}
+                size = max(last["size"], b["size"])
                 # joined letters can leave a gap wider than a space inside a Bengali or Hindi word
-                if gap <= (1.5 if ia[5] and ib[5] else CELL_GAP) * max(ia[0], ib[0]):
-                    a[2][:] = a[2] + b[2] if ia[2] <= ib[2] else b[2] + a[2]     # left piece first
-                    a[1]["spans"] = a[1]["spans"] + b[1]["spans"]
-                    rows.remove(b)
-                    joined = True
-                    break
-            if joined:
-                break
+                if (last["shaped"] or b["shaped"]) and b["x0"] - last["x1"] <= (1.5 if last["indic"] and b["indic"] else CELL_GAP) * size:
+                    chain.append(r)
+                    continue
+            if len(chain) > 1:                          # keep the piece that came first, left piece's letters first
+                keep = min(chain, key=lambda c: info[id(c)]["k"])
+                keep_chars, keep_spans = [], []
+                for c in chain:
+                    keep_chars += c[2]
+                    keep_spans += c[1]["spans"]
+                keep[2][:] = keep_chars
+                keep[1]["spans"] = keep_spans
+                gone |= {id(c) for c in chain if c is not keep}
+            chain = [r] if r is not None else []
+    if gone:
+        rows[:] = [r for r in rows if id(r) not in gone]
 
 
 def _marked_rows(rows, marks, bno0):
