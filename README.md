@@ -10,6 +10,7 @@ This is the complete source code of the PDF editing service, published under the
 ```
 app.py            the API: POST /analyze, POST /edit, GET /healthz
 edit_doc.py       the PDF editing engine
+script_text.py    other scripts: Urdu, Arabic, Hindi, Chinese, Korean... (layout and reading order)
 index.html        browser test page (served at /)
 Dockerfile        container image, fonts included
 requirements.txt  exact dependency versions
@@ -67,5 +68,7 @@ It is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; 
 implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See [LICENSE](LICENSE).
 
 Uses [PyMuPDF](https://pymupdf.readthedocs.io) © Artifex Software, Inc. (AGPL-3.0).
+Text in other scripts is drawn with MuPDF's built-in fonts (Noto, Droid Sans Fallback; SIL Open Font
+License / Apache 2.0).
 Emoji graphics: [Twemoji](https://github.com/jdecked/twemoji) © Twitter/X and contributors, licensed under
 [CC-BY 4.0](https://creativecommons.org/licenses/by/4.0/) (fetched at build time by `tools/get_emoji.py`).

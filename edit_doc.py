@@ -18,6 +18,7 @@ from statistics import median
 import pymupdf as fitz
 
 import emoji_support as em
+import script_text as sh
 
 EPS = 0.05
 FALLBACK_FONT = os.environ.get("FALLBACK_FONT")  # optional Unicode TTF/OTF for any script
@@ -334,6 +335,7 @@ class Slicer:
             pg.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE,
                                 graphics=fitz.PDF_REDACT_LINE_ART_NONE)
         target.show_pdf_page(clip + (dx, dy, dx, dy), doc, self.pno, clip=clip)
+        sh.copy_marks(pg, target, keep, dx, dy)     # lines drawn by MuPDF's layout keep their real text
         self.keep.append(doc)
 
 
@@ -483,6 +485,30 @@ def file_alias(path):
 
 
 def choose_font(doc, font_page, style, text, cache):
+    """The font for `text` in `style` (see _pick_font). Text in scripts whose letters join or change order,
+    or with characters no single font here has (Urdu, Hindi, Chinese...), is drawn by MuPDF's layout:
+    the document's font for its English letters and digits, MuPDF's built-in fonts for the rest."""
+    choice = _pick_font(doc, font_page, style, text, cache)
+    if not sh.needs_layout(text, choice["font"]):
+        return choice
+    own = "".join(c for c in em.strip(text) if sh._own_font_char(c))
+    return shaped_choice(_pick_font(doc, font_page, style, own, cache), style)
+
+
+_shaped = {}
+
+
+def shaped_choice(base, style):
+    """A font choice drawn with MuPDF's layout, `base` being the font for the document's own letters."""
+    name = base14_for(style["font"], style["flags"])
+    bold, italic = name[2:] in ("bo", "bi"), name[2:] in ("it", "bi")
+    key = (base["kind"], base["alias"], name)
+    if key not in _shaped:
+        _shaped[key] = sh.ShapedFont(base, sh.GENERIC[name[:2]], bold, italic)
+    return {"font": _shaped[key], "kind": "shaped", "ref": None, "alias": base["alias"], "base": base}
+
+
+def _pick_font(doc, font_page, style, text, cache):
     """
     Choose a font for `text` in `style`, most faithful first:
       1. the PDF's own embedded font, if it's complete and has every glyph
@@ -568,9 +594,13 @@ def use_font(page, choice, style, registered):
     return choice["alias"]
 
 
-def write_text(page, x, y, text, style, choice, fc, size=None):
-    """Write text on a baseline; emoji in it are drawn as colour pictures in line with the letters."""
+def write_text(page, x, y, text, style, choice, fc, size=None, right=False):
+    """Write text on a baseline; emoji in it are drawn as colour pictures in line with the letters.
+    right: the line is anchored at its right edge (a right-to-left line), remembered for the next edit."""
     size = size or style["size"]
+    if choice["kind"] == "shaped":
+        _write_shaped(page, x, y, text, style, choice, fc, size, right)
+        return
     if em.has_emoji(text):
         for t, is_emoji in em.split(text):
             if is_emoji:
@@ -580,6 +610,23 @@ def write_text(page, x, y, text, style, choice, fc, size=None):
                 x += choice["font"].text_length(t, fontsize=size)
         return
     _write_plain(page, x, y, text, style, choice, fc, size)
+
+
+def _write_shaped(page, x, y, text, style, choice, fc, size, right=False):
+    """Text drawn by MuPDF's layout, emoji in it as pictures; a right-to-left line's pieces go right to left.
+    The line is marked with its text and style, so it reads back exactly."""
+    font, x0 = choice["font"], x
+    fc["shaped"] = True
+    pieces = [(t, e) for t, e in em.split(text) if t]
+    if sh.is_rtl(text):
+        pieces.reverse()
+    for t, is_emoji in pieces:
+        if is_emoji:
+            x += em.draw(page, x, y, t, size, fc)
+        else:
+            x += sh.draw(page, x, y, t, size, style["color"], font)
+    asc, desc = font.ascender, font.descender
+    sh.mark(page, text, (x0, y - asc * size, max(x, x0 + 1), y - desc * size), y, {**style, "size": size}, right)
 
 
 def _write_plain(page, x, y, text, style, choice, fc, size):
@@ -776,23 +823,99 @@ def extract_lines(page):
                         for s in line["spans"] for ch in s["chars"]]
             horizontal = abs(line["dir"][0] - 1) < 1e-3 and abs(line["dir"][1]) < 1e-3
             rows.append((bno, line, allchars, horizontal))
-    _emoji_into_lines(page, rows)        # emoji the editor drew come back as characters of their line
+    marks = sh.page_marks(page)
+    _emoji_into_lines(page, rows, [m["box"] for m in marks])   # emoji the editor drew come back as characters
+    _join_rtl_rows(rows)
+    marked = _marked_rows(rows, marks, len(raw["blocks"]))     # lines the editor drew with MuPDF's layout
     for bno, line, allchars, horizontal in rows:
         if not any(not c[0].isspace() for c in allchars):
             continue
         size0 = max(s["size"] for s in line["spans"])
+        own = id(line) in marked
+        rtl = horizontal and not own and sh.has_rtl("".join(c[0] for c in allchars))
+        if horizontal and not own:
+            allchars = sh.visual_sort(allchars) if rtl else sh.dedupe_marks(allchars)
         for chars in (_segments(allchars, size0) if horizontal else [allchars]):
-            entry = _line_entry(chars, horizontal, bno)
+            if rtl:
+                chars = sh.logical(chars)
+            entry = _line_entry(chars, horizontal, bno, rtl or (own and line["rtl"]))
             if entry:
                 lines.append(entry)
     return lines
 
 
-def _emoji_into_lines(page, rows):
-    """Emoji the editor drew (pictures) go back into their line as characters, where they sit."""
+def _join_rtl_rows(rows):
+    """MuPDF splits a right-to-left line where English words or numbers sit in it: join the pieces on one
+    baseline again (only where Arabic/Hebrew letters are involved, so other PDFs read exactly as before)."""
+    def info(row):
+        cs = [c for c in row[2] if not c[0].isspace()]
+        if not row[3] or not cs:
+            return None
+        return (max(c[3]["size"] for c in cs), median(c[2][1] for c in cs),
+                min(c[1][0] for c in cs), max(c[1][2] for c in cs), sh.has_rtl("".join(c[0] for c in cs)))
+    joined = True
+    while joined:
+        joined = False
+        for a in rows:
+            ia = info(a)
+            if not ia:
+                continue
+            for b in rows:
+                ib = info(b) if b is not a else None
+                if not ib or not (ia[4] or ib[4]) or abs(ia[1] - ib[1]) > 0.3 * max(ia[0], ib[0]):
+                    continue
+                gap = max(ib[2] - ia[3], ia[2] - ib[3])
+                if gap <= CELL_GAP * max(ia[0], ib[0]):
+                    a[2][:] = a[2] + b[2]
+                    a[1]["spans"] = a[1]["spans"] + b[1]["spans"]
+                    rows.remove(b)
+                    joined = True
+                    break
+            if joined:
+                break
+
+
+def _marked_rows(rows, marks, bno0):
+    """Replace what MuPDF reads from a line the editor drew (shaped letters, often in the wrong order)
+    with the line's real text, kept in its mark. Returns the ids of the rows made from marks."""
+    made = set()
+    for k, m in enumerate(marks):
+        box, st, base = m["box"], m["style"], m["baseline"]
+        inside = fitz.Rect(box.x0 - 1, box.y0 - 1, box.x1 + 1, box.y1 + 1)
+        for row in rows[:]:
+            if id(row[1]) in made:
+                continue
+            keep = [c for c in row[2] if not fitz.Point((c[1][0] + c[1][2]) / 2, (c[1][1] + c[1][3]) / 2) in inside]
+            if len(keep) != len(row[2]):
+                row[2][:] = keep
+                if not any(not c[0].isspace() for c in keep):
+                    rows.remove(row)
+        text = m["text"]
+        if not text.strip():
+            continue
+        size = max(float(st["size"]), 1.0)
+        span = {"font": st["font"], "flags": int(st["flags"]), "size": size, "color": int(st["color"]),
+                "ascender": (base - box.y0) / size, "descender": (base - box.y1) / size, "origin": (box.x0, base)}
+        units = [t for t, _e in em.split(text) for t in ([t] if _e else list(t))]
+        step = box.width / max(len(units), 1)
+        chars = [(u, (box.x0 + i * step, box.y0, box.x0 + (i + 1) * step, box.y1), (box.x0 + i * step, base), span)
+                 for i, u in enumerate(units)]
+        line = {"spans": [span], "dir": (1.0, 0.0), "text": text, "rtl": m["right"]}
+        at = next((i for i, r in enumerate(rows)         # in its place top to bottom, like the other lines
+                   if r[2] and min(c[2][1] for c in r[2]) > base + 0.3 * size), len(rows))
+        rows.insert(at, (bno0 + k, line, chars, True))
+        made.add(id(line))
+    return made
+
+
+def _emoji_into_lines(page, rows, skip=()):
+    """Emoji the editor drew (pictures) go back into their line as characters, where they sit.
+    Emoji inside `skip` (lines whose text is kept in a mark) are already part of that text."""
     with_emoji = set()
     for cluster, r, _xref in em.page_emoji(page):
         cx, cy = (r.x0 + r.x1) / 2, (r.y0 + r.y1) / 2
+        if any(fitz.Point(cx, cy) in b for b in skip):
+            continue
         best = None
         for row in rows:
             chars = [c for c in row[2] if not c[0].isspace()]
@@ -843,7 +966,8 @@ def _emoji_into_lines(page, rows):
                 break
 
 
-def _line_entry(chars, horizontal, bno):
+def _line_entry(chars, horizontal, bno, rtl=False):
+    """One editable line. `chars` are in reading order; a right-to-left line (rtl) starts at its right."""
     solid = [c for c in chars if not c[0].isspace()]
     if not solid:
         return None
@@ -851,7 +975,7 @@ def _line_entry(chars, horizontal, bno):
     for c in solid:
         counts[id(c[3])] = counts.get(id(c[3]), 0) + 1
     main = max((c[3] for c in solid), key=lambda s: counts[id(s)])
-    marker, mchars = _marker(chars, main["size"]) if horizontal else (None, set())
+    marker, mchars = _marker(chars, main["size"]) if horizontal and not rtl else (None, set())
     if marker and not marker.get("lone"):
         # style of the item text, ignoring the bullet/number itself
         tc = {}
@@ -860,7 +984,7 @@ def _line_entry(chars, horizontal, bno):
                 tc[id(c[3])] = tc.get(id(c[3]), 0) + 1
         spans = {id(c[3]): c[3] for c in chars}
         main = spans[max(tc, key=tc.get)]
-    first = solid[0]
+    first = min(solid, key=lambda c: c[1][0]) if rtl else solid[0]    # where the line starts on the page
     # "tbox": tight glyph extents (for cutting/moving); "bbox": full line box
     # from the fonts' ascender/descender (for the editing overlay).
     tb = fitz.Rect(solid[0][1])
@@ -882,6 +1006,8 @@ def _line_entry(chars, horizontal, bno):
         "editable": horizontal,
         "block": bno,
     }
+    if rtl:
+        entry["rtl"] = True
     # styled runs, so edits can keep bold labels, italics and symbol fonts
     runs = []
     for c in chars:
@@ -1612,7 +1738,7 @@ def _avail(page, line):
     if align == "center":
         c = (x0 + x1) / 2
         return max(2 * min(c - left, right - c), x1 - x0)
-    if align == "right":
+    if align == "right" or line.get("rtl"):
         return max(x1 - left, x1 - x0)
     return right - line["x"]
 
@@ -1622,7 +1748,7 @@ def _place_x(line, width):
     align = line.get("align", "left")
     if align == "center":
         return (line["tbox"][0] + line["tbox"][2]) / 2 - width / 2
-    if align == "right":
+    if align == "right" or line.get("rtl"):        # right-to-left text keeps its right edge
         return line["tbox"][2] - width
     return line["origin"][0]
 
@@ -1671,7 +1797,7 @@ def write_line(doc, page, line, text, fc, keep_styles=True):
         scale = max(scale, 4 / max(p[1]["size"] for p in parts))
     x = _place_x(line, width * scale)
     for t, st, choice, w in parts:
-        write_text(page, x, line["origin"][1], t, st, choice, fc, size=st["size"] * scale)
+        write_text(page, x, line["origin"][1], t, st, choice, fc, size=st["size"] * scale, right=bool(line.get("rtl")))
         x += w * scale
 
 
@@ -1682,11 +1808,9 @@ def std_font(kind, bold, italic, text):
     """Helvetica / Times / Courier for sans / serif / mono; a Unicode font if the text needs more than Latin-1."""
     flags = (16 if bold else 0) | (2 if italic else 0)
     name = BASE14[STD_FONTS.get(kind, "he")][(int(bold), int(italic))]
-    fallback = default_fallback()
-    if any(ord(c) > 255 for c in em.strip(text)) and fallback:   # the standard fonts only have Latin-1
-        choice = {"font": font_obj("file", fallback), "kind": "file", "ref": fallback, "alias": file_alias(fallback)}
-    else:
-        choice = {"font": font_obj("base14", name), "kind": "base14", "ref": name, "alias": name}
+    choice = {"font": font_obj("base14", name), "kind": "base14", "ref": name, "alias": name}
+    if sh.needs_layout(text, choice["font"]):     # the standard fonts only have Latin-1
+        choice = shaped_choice(choice, {"font": name, "flags": flags})
     return choice, {"font": name, "flags": flags}
 
 
@@ -1722,7 +1846,7 @@ def write_restyled(doc, info, pno, li, text, sty, fc, warnings):
     if scale < 0.98:
         warnings.append(f"Page {pno + 1}: “{text[:30]}” didn't fit at the chosen size, so it was made smaller.")
     write_text(page, _place_x(line, width * scale), line["origin"][1], text, style, choice, fc,
-               size=style["size"] * scale)
+               size=style["size"] * scale, right=bool(line.get("rtl")))
 
 
 def _fits(doc, page, line, text, fc):
@@ -2006,6 +2130,7 @@ def apply_text_edits(doc, info, edits, fc, warnings, growth):
             for j, t in zip(slots, fit + [""] * (len(slots) - len(fit))):
                 writes.append((j, t))
         if redact:
+            sh.delete_in(page, [lines[j]["bbox"] for j in redact])
             _redact_text(page, [fitz.Rect(lines[j]["bbox"]) for j in redact])
             em.delete_in(page, [lines[j]["bbox"] for j in redact])
         for j, t in writes:
@@ -2750,7 +2875,8 @@ def apply_additions(doc, info, additions, fc, warnings):
         if rect.is_empty or rect.width < 2 or rect.height < 2:
             warnings.append(f"Page {a['page'] + 1}: something added outside the page was skipped.")
             continue
-        if a["type"] == "text" and (a.get("font") == "doc" or em.has_emoji(a["text"])):
+        if a["type"] == "text" and (a.get("font") == "doc" or em.has_emoji(a["text"])
+                                    or sh.needs_layout(a["text"], font_obj("base14", "helv"))):
             _doc_text(doc, info, page, rect, a, fc, warnings)
         elif a["type"] == "text":
             body = "<br>".join(html.escape(s) for s in a["text"].split("\n"))
@@ -2911,6 +3037,8 @@ def apply_objects(doc, info, objects, erase, warnings):
         r = fitz.Rect(e["rect"]) & page.rect
         if r.is_empty:
             continue
+        if e.get("text"):
+            sh.unmark(page, r)          # the rest of a marked line reads back as it is drawn
         page.add_redact_annot(r, fill=False, cross_out=False)
         page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_PIXELS, graphics=fitz.PDF_REDACT_LINE_ART_REMOVE_IF_COVERED,
                               text=fitz.PDF_REDACT_TEXT_REMOVE if e.get("text") else fitz.PDF_REDACT_TEXT_NONE)
@@ -2993,6 +3121,11 @@ def apply_changes(pdf_bytes, info, edits, inserts, additions=(), objects=(), era
     place_pictures(doc, pictures, warnings)
     apply_additions(doc, info, additions, fc, warnings)
     fix_tounicode(doc, fc)
+    if fc.get("shaped"):
+        try:
+            doc.subset_fonts()          # MuPDF's layout embeds its fonts whole (CJK alone is ~4 MB)
+        except Exception:
+            pass
     out = doc.tobytes(garbage=4, deflate=True)
     pages = doc.page_count
     doc.close()
@@ -3075,6 +3208,7 @@ def _public_page(pno, page, lines, lists, images=(), copies=None):
             "font": l["font"], "size": l["size"], "bold": bool(l["flags"] & 16),
             "italic": bool(l["flags"] & 2), "color": "#%06x" % l["color"],
             "align": l.get("align", "left"), "maxRight": l.get("right"), "minLeft": l.get("left"),
+            **({"rtl": True} if l.get("rtl") else {}),        # right-to-left line (Urdu, Arabic...): anchored right
         })
     out_lists = []
     for li, lst in enumerate(lists):

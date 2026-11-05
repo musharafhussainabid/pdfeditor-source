@@ -583,7 +583,7 @@ function render() {
     });
 
     // bullet symbols on their own aren't text people want to edit
-    page.lines.filter(l => l.editable && /[\p{L}\p{N}]/u.test(l.text)).forEach(line => el.appendChild(lineBox(line, Z)));
+    page.lines.filter(l => l.editable && /[\p{L}\p{N}]/u.test(l.text)).forEach(line => el.appendChild(lineBox(line, Z, page.width)));
 
     page.lists.forEach(list => list.items.forEach(item => {
       const key = `${list.id}|${item.index}`, added = inserts.has(key) ? points(inserts.get(key)) : null;
@@ -624,18 +624,23 @@ function render() {
 }
 const points = text => text.split("\n").filter(s => s.trim());
 
-function lineBox(line, Z) {
+function lineBox(line, Z, pageWidth) {
   const [x0, y0, x1, y1] = line.bbox;
   const box = document.createElement("div");
   box.className = "ln"; box.dataset.id = line.id; box.spellcheck = true; box.setAttribute("role", "textbox");
   try { box.contentEditable = "plaintext-only"; } catch { box.contentEditable = "true"; }
   if (box.contentEditable !== "plaintext-only") box.contentEditable = "true";
+  // Urdu, Arabic...: the browser lays the letters out right to left; the line stays put where it is anchored
+  box.dir = "auto"; box.style.textAlign = line.rtl ? "right" : "left";
   box.textContent = edits.has(line.id) ? edits.get(line.id) : line.text;
   Object.assign(box.style, {
     left: x0 * Z + "px", top: y0 * Z + "px",
     minWidth: (x1 - x0) * Z + "px", maxWidth: (Math.max(line.maxRight || x1, x1) - x0) * Z + 4 + "px",
     minHeight: (y1 - y0) * Z + "px", lineHeight: (y1 - y0) * Z + "px",
   });
+  if (line.rtl && pageWidth)            // a right-to-left line keeps its right edge and grows to the left
+    Object.assign(box.style, {left: "auto", right: (pageWidth - x1) * Z + "px",
+                              maxWidth: (x1 - Math.min(line.minLeft ?? x0, x0)) * Z + 4 + "px"});
   // While edited, the box hides the page's own text: it takes the colour of the page behind the
   // line (white text on a dark banner stays readable) and the line's style, or the new one.
   box._bg = () => lineBackground(box, line);
@@ -826,6 +831,7 @@ function addBox(a, Z) {
     txt.className = "addn-text"; txt.spellcheck = true; txt.setAttribute("role", "textbox");
     try { txt.contentEditable = "plaintext-only"; } catch {}
     if (txt.contentEditable !== "plaintext-only") txt.contentEditable = "true";
+    txt.dir = "auto";
     txt.textContent = a.text;
     const style = box._style = () => Object.assign(txt.style, {
       font: `${a.italic ? "italic " : ""}${a.bold ? 700 : 400} ${a.size * Z}px/1.2 ${cssFamily(a)}`, color: a.color });
