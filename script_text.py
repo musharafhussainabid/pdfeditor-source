@@ -38,6 +38,11 @@ def is_shaped_char(c):
     return _in(SHAPED_RANGES, ord(c))
 
 
+def is_indic(c):
+    """Hindi, Bengali, Tamil and the other Indic scripts."""
+    return 0x0900 <= ord(c) <= 0x0DFF
+
+
 def needs_layout(text, font):
     """Does this text need MuPDF's layout? Yes for joined/reordered scripts and for characters `font` lacks."""
     for c in em.strip(text):
@@ -315,6 +320,41 @@ def clusters(chars):
             out[-1].append(ch)
         else:
             out.append([ch])
+    return out
+
+
+UNKNOWN = chr(0xFFFD)          # what MuPDF reads for a letter the PDF doesn't identify
+I_SIGN = chr(0x093F)           # Hindi vowel sign i, drawn before its letter
+
+
+def _deva_consonant(c):
+    return len(c) == 1 and (0x0915 <= ord(c) <= 0x0939 or 0x0958 <= ord(c) <= 0x095F)
+
+
+def repair_devanagari(chars):
+    """Some PDF makers (WeasyPrint) don't say which letter the Hindi vowel sign i is: it reads as an unknown
+    character in front of its letter ("?हंदी"). It's the only sign drawn there, so it can be put back:
+    after the letter and any letters joined to it (हिंदी, कृत्रिम). If the sign is already there, the
+    unknown character is just dropped."""
+    if UNKNOWN not in "".join(c[0] for c in chars):
+        return chars
+    out, i = list(chars), 0
+    while i < len(out):
+        if out[i][0] == UNKNOWN and i + 1 < len(out) and _deva_consonant(out[i + 1][0]):
+            j = i + 2                                   # end of the letter cluster: nukta, virama + letter
+            while j < len(out):
+                if out[j][0] == chr(0x093C):
+                    j += 1
+                elif out[j][0] == chr(0x094D) and j + 1 < len(out) and _deva_consonant(out[j + 1][0]):
+                    j += 2
+                else:
+                    break
+            junk = out.pop(i)
+            if not (j - 1 < len(out) and out[j - 1][0] == I_SIGN):
+                out.insert(j - 1, (I_SIGN,) + tuple(junk[1:]))
+            i = j
+        else:
+            i += 1
     return out
 
 

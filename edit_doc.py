@@ -791,15 +791,19 @@ CELL_GAP = 0.9  # gaps wider than this (in em) separate table cells / columns
 def _segments(chars, size):
     """Split one extracted line where a gap is far wider than a word space: MuPDF
     joins neighbouring table cells into one line when they're close together."""
-    segs, cur, last = [], [], None
+    segs, cur, last, prev = [], [], None, ""
     for c in chars:
         if not c[0].isspace():
-            if last is not None and c[1][0] - last > CELL_GAP * size:
+            # inside a Bengali or Hindi word, joined letters can leave a gap wider than a space
+            gap = 1.5 if sh.is_indic(c[0][:1] or " ") and sh.is_indic(prev[:1] or " ") else CELL_GAP
+            if last is not None and c[1][0] - last > gap * size:
                 while cur and cur[-1][0].isspace():
                     cur.pop()
                 segs.append(cur)
                 cur = []
-            last = c[1][2]
+            # the furthest right so far: in Hindi and Bengali a vowel sign is drawn before its letter
+            last = c[1][2] if last is None else max(last, c[1][2])
+            prev = c[0]
         if cur or not c[0].isspace():
             cur.append(c)
     if cur:
@@ -834,7 +838,7 @@ def extract_lines(page):
         own = id(line) in marked
         rtl = horizontal and not own and sh.has_rtl("".join(c[0] for c in allchars))
         if horizontal and not own:
-            allchars = sh.visual_sort(allchars) if rtl else sh.dedupe_marks(allchars)
+            allchars = sh.visual_sort(allchars) if rtl else sh.repair_devanagari(sh.dedupe_marks(allchars))
         for chars in (_segments(allchars, size0) if horizontal else [allchars]):
             if rtl:
                 chars = sh.logical(chars)
@@ -845,14 +849,17 @@ def extract_lines(page):
 
 
 def _join_rtl_rows(rows):
-    """MuPDF splits a right-to-left line where English words or numbers sit in it: join the pieces on one
-    baseline again (only where Arabic/Hebrew letters are involved, so other PDFs read exactly as before)."""
+    """MuPDF splits a right-to-left line where English words or numbers sit in it, and a Bengali or Hindi line
+    after some joined letters: join the pieces on one baseline again (only where such scripts are involved,
+    so other PDFs read exactly as before)."""
     def info(row):
         cs = [c for c in row[2] if not c[0].isspace()]
         if not row[3] or not cs:
             return None
         return (max(c[3]["size"] for c in cs), median(c[2][1] for c in cs),
-                min(c[1][0] for c in cs), max(c[1][2] for c in cs), sh.has_rtl("".join(c[0] for c in cs)))
+                min(c[1][0] for c in cs), max(c[1][2] for c in cs),
+                any(sh.is_shaped_char(ch) for c in cs for ch in c[0]),
+                any(sh.is_indic(ch) for c in cs for ch in c[0]))
     joined = True
     while joined:
         joined = False
@@ -865,8 +872,9 @@ def _join_rtl_rows(rows):
                 if not ib or not (ia[4] or ib[4]) or abs(ia[1] - ib[1]) > 0.3 * max(ia[0], ib[0]):
                     continue
                 gap = max(ib[2] - ia[3], ia[2] - ib[3])
-                if gap <= CELL_GAP * max(ia[0], ib[0]):
-                    a[2][:] = a[2] + b[2]
+                # joined letters can leave a gap wider than a space inside a Bengali or Hindi word
+                if gap <= (1.5 if ia[5] and ib[5] else CELL_GAP) * max(ia[0], ib[0]):
+                    a[2][:] = a[2] + b[2] if ia[2] <= ib[2] else b[2] + a[2]     # left piece first
                     a[1]["spans"] = a[1]["spans"] + b[1]["spans"]
                     rows.remove(b)
                     joined = True
@@ -1008,6 +1016,8 @@ def _line_entry(chars, horizontal, bno, rtl=False):
     }
     if rtl:
         entry["rtl"] = True
+    if sh.UNKNOWN in entry["text"]:
+        entry["unreadable"] = True      # the PDF doesn't say which letters some of its shapes are
     # styled runs, so edits can keep bold labels, italics and symbol fonts
     runs = []
     for c in chars:
@@ -2089,6 +2099,10 @@ def apply_text_edits(doc, info, edits, fc, warnings, growth):
         page = doc[pno]
         lines = info["pages"][pno]["lines"]
         styled = styled_pages.get(pno, {})
+        for i in [i for i, t in changed.items() if sh.UNKNOWN in t]:      # never write unknown letters
+            del changed[i]
+            warnings.append(f"Page {pno + 1}: a line this PDF doesn't say the letters of was left as it was. "
+                            "Type its whole new text to change it.")
         changed = {i: t for i, t in changed.items()
                    if lines[i]["editable"] and (t != lines[i]["text"] or (i in styled and t))}
         if not changed:
@@ -3209,6 +3223,7 @@ def _public_page(pno, page, lines, lists, images=(), copies=None):
             "italic": bool(l["flags"] & 2), "color": "#%06x" % l["color"],
             "align": l.get("align", "left"), "maxRight": l.get("right"), "minLeft": l.get("left"),
             **({"rtl": True} if l.get("rtl") else {}),        # right-to-left line (Urdu, Arabic...): anchored right
+            **({"unreadable": True} if l.get("unreadable") else {}),   # text can't be read: offer retyping
         })
     out_lists = []
     for li, lst in enumerate(lists):

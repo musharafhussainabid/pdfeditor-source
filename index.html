@@ -85,6 +85,7 @@
   .ln{position:absolute;white-space:pre-wrap;color:transparent;caret-color:var(--ink);outline:none;cursor:text;border-radius:2px;
       transition:background .12s}
   .page:not(.has-preview) .ln{color:var(--ink)}
+  .ln.unreadable:focus:empty::before{content:attr(data-ph);color:#8a94a6;font:italic 12px system-ui,sans-serif;white-space:normal}
   .ln:hover{background:rgba(59,91,219,.10);box-shadow:0 0 0 1px rgba(59,91,219,.25)}
   .ln:focus,.ln.changed{color:var(--c,#1b2130);background:var(--bg,#fff);box-shadow:0 0 0 1.5px var(--accent)}
   .ln.changed:not(:focus){box-shadow:0 0 0 1.5px var(--accent),0 0 0 4px rgba(59,91,219,.15)}
@@ -632,7 +633,10 @@ function lineBox(line, Z, pageWidth) {
   if (box.contentEditable !== "plaintext-only") box.contentEditable = "true";
   // Urdu, Arabic...: the browser lays the letters out right to left; the line stays put where it is anchored
   box.dir = "auto"; box.style.textAlign = line.rtl ? "right" : "left";
-  box.textContent = edits.has(line.id) ? edits.get(line.id) : line.text;
+  // A line whose letters the PDF doesn't identify (some Urdu Nastaliq PDFs) opens empty for retyping
+  const base = line.unreadable ? "" : line.text;
+  if (line.unreadable) { box.classList.add("unreadable"); box.dataset.ph = "This PDF doesn't say what this line's letters are. Type the new text."; }
+  box.textContent = edits.has(line.id) ? edits.get(line.id) : base;
   Object.assign(box.style, {
     left: x0 * Z + "px", top: y0 * Z + "px",
     minWidth: (x1 - x0) * Z + "px", maxWidth: (Math.max(line.maxRight || x1, x1) - x0) * Z + 4 + "px",
@@ -665,14 +669,14 @@ function lineBox(line, Z, pageWidth) {
       e.preventDefault(); document.execCommand("insertText", false, "\n"); return;
     }
     if (e.key === "Enter") { e.preventDefault(); box.blur(); }
-    if (e.key === "Escape") { box.textContent = line.text; edits.delete(line.id); lineStyles.delete(line.id); box._restyle(); refresh(); box.blur(); }
+    if (e.key === "Escape") { box.textContent = base; edits.delete(line.id); lineStyles.delete(line.id); box._restyle(); refresh(); box.blur(); }
   });
   box.addEventListener("paste", e => {                                   // paste as plain text
     e.preventDefault(); document.execCommand("insertText", false, (e.clipboardData.getData("text/plain") || "").replace(/\r/g, ""));
   });
   box.addEventListener("input", () => {
     const t = box.innerText.replace(/\n$/, "");
-    if (t === line.text) edits.delete(line.id); else edits.set(line.id, t);
+    if (t === base) edits.delete(line.id); else edits.set(line.id, t);
     mark(); refresh();
   });
   return box;
@@ -1404,7 +1408,7 @@ $("#save").addEventListener("click", async () => {
   document.activeElement?.blur?.();
   const r2 = v => Math.round(v * 100) / 100;
   const body = {
-    edits: changedLines().map(lineId => {
+    edits: changedLines().filter(id => edits.has(id) || !lineById.get(id).unreadable).map(lineId => {
       const e = { lineId, text: edits.has(lineId) ? edits.get(lineId) : lineById.get(lineId).text }, style = styleChange(lineId);
       return style ? { ...e, style } : e;
     }),
