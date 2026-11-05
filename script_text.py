@@ -38,6 +38,15 @@ def is_shaped_char(c):
     return _in(SHAPED_RANGES, ord(c))
 
 
+_NASTALIQ = re.compile(r"nasta[l']?[ie]{1,2}q", re.I)
+
+
+def is_nastaliq(font_name):
+    """Urdu fonts in the Nastaliq style (Jameel Noori Nastaleeq, Noto Nastaliq Urdu...). PDFs made with them by
+    Word or WeasyPrint store wrong or unknown letters for most shapes, so their text can't be trusted."""
+    return bool(_NASTALIQ.search(font_name or ""))
+
+
 def is_indic(c):
     """Hindi, Bengali, Tamil and the other Indic scripts."""
     return 0x0900 <= ord(c) <= 0x0DFF
@@ -98,8 +107,11 @@ class ShapedFont:
     """Measures text the way MuPDF's layout will draw it. `base` is the font choice for the document's own
     letters; `generic` (sans-serif / serif / monospace) picks the look of the built-in fonts for the rest."""
 
-    def __init__(self, base, generic, bold, italic):
+    def __init__(self, base, generic, bold, italic, script_font=None, script_scale=1.0):
+        """script_font: a font file for the other letters instead of MuPDF's own (Noto Nastaliq Urdu for
+        lines that were in a Nastaliq font); script_scale: its size against the line's size."""
         self.base, self.generic, self.bold, self.italic = base, generic, bold, italic
+        self.script_font, self.script_scale = script_font, script_scale
         self._font = base["font"]
         self._widths = {}
 
@@ -119,9 +131,13 @@ class ShapedFont:
             face = f"@font-face{{font-family:docf;src:url(docf.ttf);font-weight:{weight};font-style:{style}}}"
         else:
             own, face = self.generic, ""
+        other = self.generic
+        if self.script_font:
+            face += f"@font-face{{font-family:scrf;src:url(scrf.ttf);font-weight:{weight};font-style:{style}}}"
+            other = f"scrf,{self.generic};font-size:{self.script_scale:g}em"
         css = (f"{face} *{{margin:0;padding:0}} div{{font-size:{size}px;line-height:1.5;white-space:pre;"
                f"text-align:left;font-weight:{weight};font-style:{style};color:#{color & 0xFFFFFF:06x}}} "
-               f"span.d{{font-family:{own},{self.generic}}} span.o{{font-family:{self.generic}}}")
+               f"span.d{{font-family:{own},{self.generic}}} span.o{{font-family:{other}}}")
         runs, cur, cur_own = [], "", None
         for c in text:
             mine = _own_font_char(c) and self._font.has_glyph(ord(c)) if not c.isspace() else cur_own
@@ -133,9 +149,12 @@ class ShapedFont:
             runs.append((cur, cur_own))
         body = "".join(f'<span class="{"d" if mine else "o"}">{html.escape(t)}</span>' for t, mine in runs)
         archive = None
-        if buf is not None:
+        if buf is not None or self.script_font:
             archive = fitz.Archive()
+        if buf is not None:
             archive.add((buf, "docf.ttf"))
+        if self.script_font:
+            archive.add((_font_bytes({"kind": "file", "ref": self.script_font}), "scrf.ttf"))
         return f"<div>{body}</div>", css, archive      # MuPDF reads the direction from the text itself
 
     def layout(self, text, size):

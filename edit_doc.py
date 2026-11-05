@@ -498,13 +498,28 @@ def choose_font(doc, font_page, style, text, cache):
 _shaped = {}
 
 
+NASTALIQ_FONT = os.environ.get("NASTALIQ_FONT")    # optional: Noto Nastaliq Urdu file (else found installed)
+
+
+def nastaliq_font(bold):
+    """An installed Nastaliq font file (Noto Nastaliq Urdu: fonts-noto-core on the server), or None."""
+    if NASTALIQ_FONT:
+        return NASTALIQ_FONT
+    fonts = system_fonts()
+    return (fonts.get("notonastaliqurdubold") if bold else None) or fonts.get("notonastaliqurdu")
+
+
 def shaped_choice(base, style):
-    """A font choice drawn with MuPDF's layout, `base` being the font for the document's own letters."""
+    """A font choice drawn with MuPDF's layout, `base` being the font for the document's own letters.
+    Text that replaces a Nastaliq line (the usual Urdu book style) is drawn in Nastaliq too, when installed."""
     name = base14_for(style["font"], style["flags"])
     bold, italic = name[2:] in ("bo", "bi"), name[2:] in ("it", "bi")
-    key = (base["kind"], base["alias"], name)
+    nast = nastaliq_font(bold) if sh.is_nastaliq(style["font"]) else None
+    # Noto Nastaliq is drawn larger than other Nastaliq fonts at the same size (Jameel Noori: about 1.35x wider)
+    scale = 1.0 if not nast or "noto" in style["font"].lower() else 0.75
+    key = (base["kind"], base["alias"], name, nast, scale)
     if key not in _shaped:
-        _shaped[key] = sh.ShapedFont(base, sh.GENERIC[name[:2]], bold, italic)
+        _shaped[key] = sh.ShapedFont(base, sh.GENERIC[name[:2]], bold, italic, nast, scale)
     return {"font": _shaped[key], "kind": "shaped", "ref": None, "alias": base["alias"], "base": base}
 
 
@@ -830,6 +845,7 @@ def extract_lines(page):
     marks = sh.page_marks(page)
     _emoji_into_lines(page, rows, [m["box"] for m in marks])   # emoji the editor drew come back as characters
     _join_rtl_rows(rows)
+    _join_nastaliq_rows(rows)
     marked = _marked_rows(rows, marks, len(raw["blocks"]))     # lines the editor drew with MuPDF's layout
     for bno, line, allchars, horizontal in rows:
         if not any(not c[0].isspace() for c in allchars):
@@ -844,8 +860,58 @@ def extract_lines(page):
                 chars = sh.logical(chars)
             entry = _line_entry(chars, horizontal, bno, rtl or (own and line["rtl"]))
             if entry:
+                if not own and sh.is_nastaliq(entry["font"]):
+                    entry["unreadable"] = True      # Nastaliq text in PDFs is stored with wrong letters
                 lines.append(entry)
     return lines
+
+
+def _join_nastaliq_rows(rows):
+    """In Nastaliq each word slopes down from right to left, so MuPDF reads one line as many pieces at
+    different heights: pieces whose drawn letters overlap in height and sit side by side are one line."""
+    def is_nast(row):
+        cs = [c for c in row[2] if not c[0].isspace()]
+        return row[3] and cs and sum(sh.is_nastaliq(c[3]["font"]) for c in cs) * 2 > len(cs)
+    cand = [r for r in rows if is_nast(r)]
+    if len(cand) < 2:
+        return
+    box = {}
+    for r in cand:
+        cs = [c for c in r[2] if not c[0].isspace()]
+        box[id(r)] = [min(c[1][1] for c in cs), max(c[1][3] for c in cs),
+                      min(c[1][0] for c in cs), max(c[1][2] for c in cs), max(c[3]["size"] for c in cs)]
+    order = {id(r): k for k, r in enumerate(rows)}
+    parent = {id(r): id(r) for r in cand}
+
+    def root(k):
+        while parent[k] != k:
+            parent[k] = parent[parent[k]]
+            k = parent[k]
+        return k
+    for i, a in enumerate(cand):
+        for b in cand[i + 1:]:
+            A, B = box[id(a)], box[id(b)]
+            overlap = min(A[1], B[1]) - max(A[0], B[0])
+            gap = max(B[2] - A[3], A[2] - B[3])
+            if overlap > 0.2 * min(A[1] - A[0], B[1] - B[0]) and gap <= 2 * max(A[4], B[4]):
+                parent[root(id(a))] = root(id(b))
+    groups = {}
+    for r in cand:
+        groups.setdefault(root(id(r)), []).append(r)
+    gone = set()
+    for g in groups.values():
+        if len(g) < 2:
+            continue
+        keep = min(g, key=lambda r: order[id(r)])
+        chars, spans = [], []
+        for r in g:
+            chars += r[2]
+            spans += r[1]["spans"]
+        keep[2][:] = chars
+        keep[1]["spans"] = spans
+        gone |= {id(r) for r in g if r is not keep}
+    if gone:
+        rows[:] = [r for r in rows if id(r) not in gone]
 
 
 def _join_rtl_rows(rows):
