@@ -86,13 +86,16 @@ class RequestError(Exception):
         return (RequestError, (self.status, self.detail))
 
 
-async def engine(fn, *args):
-    """Run PDF work off the web process: in a thread for a single engine, else in the engine pool."""
+async def engine(fn, *args, deadline=None):
+    """Run PDF work off the web process: in a thread for a single engine, else in the engine pool.
+    deadline: the loop time by which the whole request must finish (default: JOB_TIMEOUT from now)."""
+    loop = asyncio.get_running_loop()
+    timeout = JOB_TIMEOUT if deadline is None else max(0.0, deadline - loop.time())
     try:
         if ENGINES == 1:
-            return await asyncio.wait_for(run_in_threadpool(fn, *args), JOB_TIMEOUT)
-        fut = asyncio.get_running_loop().run_in_executor(engine_pool(), fn, *args)
-        return await asyncio.wait_for(fut, JOB_TIMEOUT)
+            return await asyncio.wait_for(run_in_threadpool(fn, *args), timeout)
+        fut = loop.run_in_executor(engine_pool(), fn, *args)
+        return await asyncio.wait_for(fut, timeout)
     except RequestError as exc:
         raise HTTPException(exc.status, exc.detail)
     except BrokenProcessPool:
@@ -208,17 +211,51 @@ async def read_pdf(file):
     return data
 
 
-def analysis(data, detail_pages=None):
+def analysis(data, detail_pages=None, parts=None):
     """The engine's analysis (runs in an engine process)."""
     try:
-        return edit_doc.analyze(data, max_pages=MAX_PAGES or None, detail_pages=detail_pages)
+        return edit_doc.analyze(data, max_pages=MAX_PAGES or None, detail_pages=detail_pages, parts=parts)
     except edit_doc.PdfRejected as exc:
         raise RequestError(422, {"code": exc.code, "message": str(exc)})
 
 
-def analyze_job(data, previews):
+# Long PDFs: the pages are split into parts that several engines read at once, then one engine
+# joins them. Same result as one engine reading every page, several times faster when engines are free.
+SPLIT_PAGES = int(os.environ.get("SPLIT_PAGES", "16"))    # fewest pages per part; 0 = never split
+SPLIT_MAX_MB = 400        # each part gets its own copy of the PDF: keep the copies under this in total
+
+
+def page_count_job(data):
+    try:
+        return edit_doc.page_count(data, MAX_PAGES or None)
+    except edit_doc.PdfRejected as exc:
+        raise RequestError(422, {"code": exc.code, "message": str(exc)})
+
+
+def read_pages_job(data, start, stop, detail_pages):
+    try:
+        return edit_doc.read_pages(data, start, stop, detail_pages)
+    except edit_doc.PdfRejected as exc:
+        raise RequestError(422, {"code": exc.code, "message": str(exc)})
+
+
+async def read_parts(data, deadline, detail_pages=None):
+    """Every page's reading for a long PDF, done by several engines at once; None for a short one."""
+    if ENGINES == 1 or not SPLIT_PAGES:
+        return None
+    n = await engine(page_count_job, data, deadline=deadline)
+    k = min(ENGINES, n // SPLIT_PAGES, int(SPLIT_MAX_MB * 1024 * 1024 // max(1, len(data))))
+    if k < 2:
+        return None
+    bounds = [n * i // k for i in range(k + 1)]
+    results = await asyncio.gather(*(engine(read_pages_job, data, a, b, detail_pages, deadline=deadline)
+                                     for a, b in zip(bounds, bounds[1:])))
+    return [page for part in results for page in part]
+
+
+def analyze_job(data, previews, parts=None):
     """Everything /analyze does with the PDF, in one engine call: returns the JSON body and page count."""
-    _info, layout = analysis(data)
+    _info, layout = analysis(data, parts=parts)
     if previews:
         pages = layout["pages"][:PREVIEW_PAGES]
         for page, url in zip(pages, edit_doc.page_previews(data, [p["index"] for p in pages])):
@@ -233,7 +270,9 @@ async def analyze(request: Request, file: UploadFile = File(...), previews: bool
     check_key(x_api_key)
     check_rate(request)
     data = await read_pdf(file)
-    body, pages = await engine(analyze_job, data, previews)
+    deadline = asyncio.get_running_loop().time() + JOB_TIMEOUT
+    parts = await read_parts(data, deadline)
+    body, pages = await engine(analyze_job, data, previews, parts, deadline=deadline)
     request.state.log = {"pages": pages, "previews": previews}
     return Response(body, media_type="application/json")
 
@@ -393,7 +432,9 @@ async def edit(request: Request, file: UploadFile = File(...), changes: str = Fo
     check_rate(request)
     data = await read_pdf(file)
     files = await read_images(images)
-    out, warnings, counts = await engine(edit_job, data, changes, files)
+    deadline = asyncio.get_running_loop().time() + JOB_TIMEOUT
+    parts = await read_parts(data, deadline, changed_pages(changes))
+    out, warnings, counts = await engine(edit_job, data, changes, files, parts, deadline=deadline)
     request.state.log = {**counts, "warnings": len(warnings), "bytesOut": len(out)}
     name = (file.filename or "document.pdf").rsplit(".", 1)[0]
     return Response(out, media_type="application/pdf", headers={
@@ -401,15 +442,33 @@ async def edit(request: Request, file: UploadFile = File(...), changes: str = Fo
         "X-Edit-Warnings": json.dumps(warnings)})
 
 
-def edit_job(data, changes, files):
+def edit_job(data, changes, files, parts=None):
     """Everything /edit does with the PDF, in one engine call: check the changes, apply them."""
     try:
-        return _edit(data, changes, files)
+        return _edit(data, changes, files, parts)
     except HTTPException as exc:          # a refused request: carry it back to the web process
         raise RequestError(exc.status_code, exc.detail)
 
 
-def _edit(data, changes, files):
+def _detail_pages(body):
+    """The pages whose text or lists change: only those need the slow part of the analysis."""
+    detail = {int(m[1]) for m in (re.match(r"p(\d+)-", str(x.get("lineId", "") if isinstance(x, dict) else ""))
+                                  for x in body.get("edits") or []) if m}
+    detail |= {int(m[1]) for m in (re.match(r"p(\d+)-", str(x.get("listId", "") if isinstance(x, dict) else ""))
+                                   for x in body.get("inserts") or []) if m}
+    return detail
+
+
+def changed_pages(changes):
+    """_detail_pages for the raw 'changes' text; an empty set when it isn't valid (edit_job refuses it)."""
+    try:
+        body = json.loads(changes)
+        return _detail_pages(body) if isinstance(body, dict) else set()
+    except (ValueError, AttributeError, TypeError):
+        return set()
+
+
+def _edit(data, changes, files, parts=None):
     try:
         body = json.loads(changes)
     except ValueError:
@@ -418,11 +477,7 @@ def _edit(data, changes, files):
         raise HTTPException(400, "'changes' must be a JSON object.")
     # Same PDF -> same analysis -> the ids from /analyze match. Only the pages whose text or lists
     # change need the slow part of the analysis (columns, lists): much faster for long or dense PDFs.
-    detail = {int(m[1]) for m in (re.match(r"p(\d+)-", str(x.get("lineId", "") if isinstance(x, dict) else ""))
-                                  for x in body.get("edits") or []) if m}
-    detail |= {int(m[1]) for m in (re.match(r"p(\d+)-", str(x.get("listId", "") if isinstance(x, dict) else ""))
-                                   for x in body.get("inserts") or []) if m}
-    info, _layout = analysis(data, detail)
+    info, _layout = analysis(data, _detail_pages(body), parts)
     edits, inserts = [], []
     pages = info["pages"]
     for e in body.get("edits") or []:

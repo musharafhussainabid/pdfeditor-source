@@ -192,6 +192,10 @@ def cluster_of(doc, xref):
 def page_emoji(page):
     """The editor's emoji on a page: [(cluster, Rect, xref)]."""
     doc, out = page.parent, []
+    # Finding where each image is drawn means decoding every image on the page: skip it when
+    # none of the page's images is one of the editor's emoji (almost every page).
+    if not any(cluster_of(doc, item[0]) for item in page.get_images(full=True)):
+        return out
     for im in page.get_image_info(xrefs=True):
         c = cluster_of(doc, im.get("xref") or 0)
         if c:

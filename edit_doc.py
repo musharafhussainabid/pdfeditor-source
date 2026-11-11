@@ -12,6 +12,7 @@ import bisect
 import json
 import os
 import re
+import struct
 import zlib
 from statistics import median
 
@@ -919,6 +920,8 @@ def _join_rtl_rows(rows):
     after some joined letters: join the pieces on one baseline again (only where such scripts are involved,
     so other PDFs read exactly as before). Each piece is measured once and compared only with its
     neighbours on the same baseline (a 300-page Urdu book took minutes otherwise)."""
+    if not any(row[3] and sh.has_shaped("".join(c[0] for c in row[2])) for row in rows):
+        return                                          # no such script on the page (most pages)
     info = {}
     for k, row in enumerate(rows):
         cs = [c for c in row[2] if not c[0].isspace()]
@@ -927,7 +930,7 @@ def _join_rtl_rows(rows):
         text = "".join(c[0] for c in cs)
         info[id(row)] = {"k": k, "size": max(c[3]["size"] for c in cs), "base": median(c[2][1] for c in cs),
                          "x0": min(c[1][0] for c in cs), "x1": max(c[1][2] for c in cs),
-                         "shaped": any(sh.is_shaped_char(ch) for ch in text), "indic": any(sh.is_indic(ch) for ch in text)}
+                         "shaped": sh.has_shaped(text), "indic": any(sh.is_indic(ch) for ch in text)}
     if not any(i["shaped"] for i in info.values()):
         return
     pieces = sorted((r for r in rows if id(r) in info), key=lambda r: info[id(r)]["base"])
@@ -1059,6 +1062,25 @@ def _emoji_into_lines(page, rows, skip=()):
                 break
 
 
+_F32 = struct.Struct("4f")
+
+
+def _union(boxes):
+    """fitz.Rect(boxes[0]) | boxes[1] | ..., without making a Rect per box (the slow part of
+    reading long documents). MuPDF keeps rectangles in single precision, so the result is rounded
+    the same way; boxes MuPDF treats specially (empty, inverted, huge) take MuPDF's own path."""
+    if len(boxes) == 1:
+        return fitz.Rect(boxes[0])
+    x0, y0, x1, y1 = zip(*boxes)
+    lo, hi = min(min(x0), min(y0)), max(max(x1), max(y1))
+    if lo > -1e9 and hi < 1e9 and all(a < b for a, b in zip(x0, x1)) and all(a < b for a, b in zip(y0, y1)):
+        return fitz.Rect(_F32.unpack(_F32.pack(min(x0), min(y0), max(x1), max(y1))))
+    tb = fitz.Rect(boxes[0])
+    for b in boxes[1:]:
+        tb |= fitz.Rect(b)
+    return tb
+
+
 def _line_entry(chars, horizontal, bno, rtl=False):
     """One editable line. `chars` are in reading order; a right-to-left line (rtl) starts at its right."""
     solid = [c for c in chars if not c[0].isspace()]
@@ -1080,9 +1102,7 @@ def _line_entry(chars, horizontal, bno, rtl=False):
     first = min(solid, key=lambda c: c[1][0]) if rtl else solid[0]    # where the line starts on the page
     # "tbox": tight glyph extents (for cutting/moving); "bbox": full line box
     # from the fonts' ascender/descender (for the editing overlay).
-    tb = fitz.Rect(solid[0][1])
-    for c in solid[1:]:
-        tb |= fitz.Rect(c[1])
+    tb = _union([c[1] for c in solid])
     used = {id(c[3]): c[3] for c in solid}.values()
     y0 = min(s["origin"][1] - s["ascender"] * s["size"] for s in used)
     y1 = max(s["origin"][1] - s["descender"] * s["size"] for s in used)
@@ -1537,8 +1557,9 @@ def detect_lists(page, lines, drawings=None):
 PAGENUM_RE = re.compile(r"^\s*(page\s+)?[-–]?\s*\d{1,4}\s*[-–]?(\s*(of|/)\s*\d{1,4})?\s*$", re.I)
 
 
-def page_bands(doc, all_lines):
-    """Detect repeating headers/footers and page numbers; compute body limits."""
+def page_bands(doc, all_lines, image_boxes=None):
+    """Detect repeating headers/footers and page numbers; compute body limits.
+    image_boxes: each page's picture boxes (clipped to the page), when already read."""
     def norm(t):
         return re.sub(r"\d+", "#", t.strip().lower())
 
@@ -1568,7 +1589,10 @@ def page_bands(doc, all_lines):
                 foot.append(l)
             else:
                 body.append(fitz.Rect(b))
-        body += [fitz.Rect(x["bbox"]) & page.rect for x in page.get_image_info()]
+        if image_boxes is None:
+            body += [fitz.Rect(x["bbox"]) & page.rect for x in page.get_image_info()]
+        else:
+            body += [fitz.Rect(r) for r in image_boxes[p]]
         body = [r for r in body if not r.is_empty]
         pi = {
             "header_bottom": round(max(l["bbox"][3] for l in head), 2) if head else None,
@@ -3006,14 +3030,31 @@ def is_digitally_signed(doc):
 # --------------------------------------------------------------------------- #
 # Existing images (remove / move / replace) and erased areas
 # --------------------------------------------------------------------------- #
-def page_images(page):
+def image_info(page, digests=None):
+    """page.get_image_info(xrefs=True). digests (xref -> fingerprint), shared by the pages of one
+    document, means each image object is decoded and fingerprinted once, not on every page and call."""
+    if digests is None:
+        return page.get_image_info(xrefs=True)
+    info = page.get_image_info(hashes=True)        # PyMuPDF keeps this on the page
+    by_digest = {}
+    for item in page.get_images():                  # same matching as PyMuPDF's xrefs=True
+        xref = item[0]
+        if xref not in digests:
+            digests[xref] = fitz.Pixmap(page.parent, xref).digest
+        by_digest[digests[xref]] = xref
+    for im in info:
+        im["xref"] = by_digest.get(im["digest"], 0)
+    return info
+
+
+def page_images(page, digests=None):
     """Images drawn on a page, in drawing order: [{"bbox", "xref", "full"}]; an image's id is its index.
     "full" = it covers most of the page (a scan or a background), so it isn't offered for clicking.
     Pages turned sideways get none, like the rest of their editing."""
     if page.rotation:
         return []
     area, out = page.rect.get_area(), []
-    for im in page.get_image_info(xrefs=True):
+    for im in image_info(page, digests):
         if em.cluster_of(page.parent, int(im.get("xref") or 0)):
             continue                     # an emoji the editor drew: part of its line
         r = fitz.Rect(im["bbox"]) & page.rect
@@ -3259,11 +3300,8 @@ def warm_up():
     return True
 
 
-def analyze(pdf_bytes, max_pages=None, detail_pages=None):
-    """Extract editable lines and lists. Returns (info, layout).
-    detail_pages: when saving, the pages being changed. Only those get the slow part (column
-    bounds and list detection); every page still gets its lines, ids, styles, pictures and
-    header/footer bands, so ids and everything else stay exactly as /analyze reported them."""
+def open_pdf(pdf_bytes, max_pages=None):
+    """Open an uploaded PDF, refusing unreadable, password-protected or (if limited) too long files."""
     try:
         doc = fitz.open("pdf", pdf_bytes)
     except Exception:
@@ -3272,9 +3310,59 @@ def analyze(pdf_bytes, max_pages=None, detail_pages=None):
         raise PdfRejected("PDF_ENCRYPTED", "The PDF is password-protected.")
     if max_pages and doc.page_count > max_pages:
         raise PdfRejected("PDF_TOO_MANY_PAGES", f"The PDF has more than {max_pages} pages.")
-    all_lines = [extract_lines(page) for page in doc]
-    bands = page_bands(doc, all_lines)
-    all_images = [page_images(page) for page in doc]
+    return doc
+
+
+def page_count(pdf_bytes, max_pages=None):
+    doc = open_pdf(pdf_bytes, max_pages)
+    n = doc.page_count
+    doc.close()
+    return n
+
+
+def _read_page(page, pno, detail_pages, digests=None):
+    """Everything analyze() learns from one page on its own: (lines, what page_bands needs, images, lists).
+    digests: the document's image fingerprints so far (see image_info)."""
+    lines = extract_lines(page)
+    images = page_images(page, digests)
+    # page_bands sees each line as it was before the column step, and every picture's box
+    band_in = ([{"text": l["text"], "bbox": tuple(l["bbox"])} for l in lines],
+               [tuple(fitz.Rect(x["bbox"]) & page.rect) for x in page.get_image_info()])
+    lists = []
+    if detail_pages is None or pno in detail_pages:
+        drawings = page.get_drawings()          # read once, used by both steps
+        column_rights(page, lines, drawings)
+        lists = detect_lists(page, lines, drawings) if lines else []
+    for l in lines:
+        l.pop("_marker", None)
+    return lines, band_in, images, lists
+
+
+def read_pages(pdf_bytes, start, stop, detail_pages=None):
+    """The page-by-page part of analyze() for pages start..stop-1. A long PDF is split into such
+    parts, read by several engines at once, and joined with analyze(..., parts=...)."""
+    doc = open_pdf(pdf_bytes)
+    digests = {}
+    out = [_read_page(doc[pno], pno, detail_pages, digests) for pno in range(start, min(stop, doc.page_count))]
+    doc.close()
+    return out
+
+
+def analyze(pdf_bytes, max_pages=None, detail_pages=None, parts=None):
+    """Extract editable lines and lists. Returns (info, layout).
+    detail_pages: when saving, the pages being changed. Only those get the slow part (column
+    bounds and list detection); every page still gets its lines, ids, styles, pictures and
+    header/footer bands, so ids and everything else stay exactly as /analyze reported them.
+    parts: every page's read_pages() result, when the pages were already read by several engines."""
+    doc = open_pdf(pdf_bytes, max_pages)
+    if parts is None:
+        digests = {}
+        parts = [_read_page(page, pno, detail_pages, digests) for pno, page in enumerate(doc)]
+    if len(parts) != doc.page_count:
+        raise ValueError("parts don't cover every page")
+    all_lines = [p[0] for p in parts]
+    bands = page_bands(doc, [p[1][0] for p in parts], [p[1][1] for p in parts])
+    all_images = [p[2] for p in parts]
     copies = {}
     for imgs in all_images:
         for im in imgs:
@@ -3282,13 +3370,7 @@ def analyze(pdf_bytes, max_pages=None, detail_pages=None):
                 copies[im["xref"]] = copies.get(im["xref"], 0) + 1
     pages, layout_pages = [], []
     for pno, (page, lines, band) in enumerate(zip(doc, all_lines, bands)):
-        lists = []
-        if detail_pages is None or pno in detail_pages:
-            drawings = page.get_drawings()          # read once, used by both steps
-            column_rights(page, lines, drawings)
-            lists = detect_lists(page, lines, drawings) if lines else []
-        for l in lines:
-            l.pop("_marker", None)
+        lists = parts[pno][3]
         pages.append({"lines": lines, "lists": lists, "images": all_images[pno], **band})
         layout_pages.append(_public_page(pno, page, lines, lists, all_images[pno], copies))
     has_text = any(all_lines)

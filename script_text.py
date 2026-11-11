@@ -12,6 +12,7 @@ Reading: right-to-left lines in other PDFs come out of MuPDF jumbled (English wo
 reversed or split off). Their characters still have their true positions, so the reading order is rebuilt
 from those positions.
 """
+import functools
 import html
 import json
 import re
@@ -34,13 +35,22 @@ def _in(ranges, o):
     return any(a <= o <= b for a, b in ranges)
 
 
+_SHAPED_RE = re.compile("[" + "".join(re.escape(chr(a)) + "-" + re.escape(chr(b)) for a, b in SHAPED_RANGES) + "]")
+
+
 def is_shaped_char(c):
-    return _in(SHAPED_RANGES, ord(c))
+    return _SHAPED_RE.match(c) is not None
+
+
+def has_shaped(text):
+    """Does the text have any letter of SHAPED_RANGES? (one regex search: fast on long documents)"""
+    return _SHAPED_RE.search(text) is not None
 
 
 _NASTALIQ = re.compile(r"nasta[l']?[ie]{1,2}q", re.I)
 
 
+@functools.lru_cache(maxsize=4096)
 def is_nastaliq(font_name):
     """Urdu fonts in the Nastaliq style (Jameel Noori Nastaleeq, Noto Nastaliq Urdu...). PDFs made with them by
     Word or WeasyPrint store wrong or unknown letters for most shapes, so their text can't be trusted."""
