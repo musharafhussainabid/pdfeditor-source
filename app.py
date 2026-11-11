@@ -86,16 +86,94 @@ class RequestError(Exception):
         return (RequestError, (self.status, self.detail))
 
 
-async def engine(fn, *args, deadline=None):
+# Fair use of the engines. Work for long documents (LONG_PAGES+ pages) never takes the last RESERVED
+# engines, so short documents always find one free; waiting short work starts before waiting long work,
+# and long work that has waited AGING seconds is treated like short work, so it isn't held back forever.
+RESERVED = int(os.environ.get("RESERVED_ENGINES", "2"))
+AGING = 15.0
+BUSY_MESSAGE = "The editor is very busy. Please try again in a moment."
+
+
+class EngineSlots:
+    """At most `size` jobs in the engine pool at once; the rest wait here in a fair order."""
+
+    def __init__(self, size, reserved):
+        self.loop = asyncio.get_running_loop()
+        self.size, self.long_cap = size, max(1, size - reserved)
+        self.free, self.long_running, self.waiting, self.seq = size, 0, [], 0
+
+    def _pump(self):
+        now = self.loop.time()
+        while self.free > 0:
+            ready = [w for w in self.waiting if not w["fut"].done()
+                     and (not w["long"] or self.long_running < self.long_cap)]
+            if not ready:
+                break
+            w = min(ready, key=lambda w: (w["long"] and now - w["t0"] < AGING, w["seq"]))
+            self.waiting.remove(w)
+            self.free -= 1
+            self.long_running += w["long"]
+            w["fut"].set_result(None)
+        self.waiting = [w for w in self.waiting if not w["fut"].done()]
+
+    async def acquire(self, long):
+        self.seq += 1
+        w = {"long": long, "seq": self.seq, "t0": self.loop.time(), "fut": self.loop.create_future()}
+        self.waiting.append(w)
+        self._pump()
+        try:
+            await w["fut"]
+        except asyncio.CancelledError:          # gave up waiting (timeout): pass on a slot it was just given
+            if w["fut"].done() and not w["fut"].cancelled():
+                self.release(long)
+            w["fut"].cancel()
+            raise
+
+    def release(self, long):
+        self.free += 1
+        self.long_running -= long
+        self._pump()
+
+    def release_threadsafe(self, long):
+        try:
+            self.loop.call_soon_threadsafe(self.release, long)
+        except RuntimeError:                    # the loop is gone (only in tests)
+            pass
+
+
+_slots = None
+
+
+def engine_slots():
+    global _slots
+    if _slots is None or _slots.loop is not asyncio.get_running_loop() or _slots.size != ENGINES:
+        _slots = EngineSlots(ENGINES, RESERVED)
+    return _slots
+
+
+async def engine(fn, *args, deadline=None, long=False):
     """Run PDF work off the web process: in a thread for a single engine, else in the engine pool.
-    deadline: the loop time by which the whole request must finish (default: JOB_TIMEOUT from now)."""
+    deadline: the loop time by which the whole request must finish (default: JOB_TIMEOUT from now).
+    long: work for a long document (see EngineSlots).
+    A request that never got an engine in time is 503 BUSY; one that ran out of time is 504 TIMEOUT."""
     loop = asyncio.get_running_loop()
-    timeout = JOB_TIMEOUT if deadline is None else max(0.0, deadline - loop.time())
+    deadline = loop.time() + JOB_TIMEOUT if deadline is None else deadline
     try:
         if ENGINES == 1:
-            return await asyncio.wait_for(run_in_threadpool(fn, *args), timeout)
-        fut = loop.run_in_executor(engine_pool(), fn, *args)
-        return await asyncio.wait_for(fut, timeout)
+            return await asyncio.wait_for(run_in_threadpool(fn, *args), max(0.0, deadline - loop.time()))
+        slots = engine_slots()
+        try:
+            await asyncio.wait_for(slots.acquire(long), max(0.0, deadline - loop.time()))
+        except asyncio.TimeoutError:
+            raise HTTPException(503, BUSY_MESSAGE)
+        try:
+            cfut = engine_pool().submit(fn, *args)
+        except Exception:
+            slots.release(long)
+            raise
+        # the engine is free again when the job really ends, even if this request stopped waiting
+        cfut.add_done_callback(lambda _f: slots.release_threadsafe(long))
+        return await asyncio.wait_for(asyncio.wrap_future(cfut), max(0.0, deadline - loop.time()))
     except RequestError as exc:
         raise HTTPException(exc.status, exc.detail)
     except BrokenProcessPool:
@@ -104,7 +182,8 @@ async def engine(fn, *args, deadline=None):
     except asyncio.TimeoutError:
         if not engines_alive():
             _reset_pool("No engine processes left")
-        raise HTTPException(503, "The editor is very busy. Please try again in a moment.")
+        raise HTTPException(504, {"code": "TIMEOUT", "message":
+            f"This PDF took longer than {JOB_TIMEOUT:g} seconds to process. Very long or complex PDFs may need to be split."})
 
 
 # --------------------------------------------------------------------------- #
@@ -221,7 +300,10 @@ def analysis(data, detail_pages=None, parts=None):
 
 # Long PDFs: the pages are split into parts that several engines read at once, then one engine
 # joins them. Same result as one engine reading every page, several times faster when engines are free.
+# A long document gets at most SPLIT_MAX_PARTS engines, and only engines that are free right now.
 SPLIT_PAGES = int(os.environ.get("SPLIT_PAGES", "16"))    # fewest pages per part; 0 = never split
+SPLIT_MAX_PARTS = int(os.environ.get("SPLIT_MAX_PARTS", "3"))
+LONG_PAGES = int(os.environ.get("LONG_PAGES", "32"))      # from this many pages a document counts as long
 SPLIT_MAX_MB = 400        # each part gets its own copy of the PDF: keep the copies under this in total
 
 
@@ -240,17 +322,23 @@ def read_pages_job(data, start, stop, detail_pages):
 
 
 async def read_parts(data, deadline, detail_pages=None):
-    """Every page's reading for a long PDF, done by several engines at once; None for a short one."""
-    if ENGINES == 1 or not SPLIT_PAGES:
-        return None
+    """(parts, long): for a long PDF, every page's reading done by several free engines at once
+    (parts None when not split); long tells the rest of the request to queue as long work."""
+    if ENGINES == 1:
+        return None, False
     n = await engine(page_count_job, data, deadline=deadline)
-    k = min(ENGINES, n // SPLIT_PAGES, int(SPLIT_MAX_MB * 1024 * 1024 // max(1, len(data))))
+    long = n >= LONG_PAGES
+    if not long or not SPLIT_PAGES:
+        return None, long
+    slots = engine_slots()
+    free_for_long = min(slots.free, slots.long_cap - slots.long_running)
+    k = min(SPLIT_MAX_PARTS, free_for_long, n // SPLIT_PAGES, int(SPLIT_MAX_MB * 1024 * 1024 // max(1, len(data))))
     if k < 2:
-        return None
+        return None, long                # engines busy: one engine reads it, without holding up others
     bounds = [n * i // k for i in range(k + 1)]
-    results = await asyncio.gather(*(engine(read_pages_job, data, a, b, detail_pages, deadline=deadline)
+    results = await asyncio.gather(*(engine(read_pages_job, data, a, b, detail_pages, deadline=deadline, long=True)
                                      for a, b in zip(bounds, bounds[1:])))
-    return [page for part in results for page in part]
+    return [page for part in results for page in part], long
 
 
 def analyze_job(data, previews, parts=None):
@@ -271,8 +359,8 @@ async def analyze(request: Request, file: UploadFile = File(...), previews: bool
     check_rate(request)
     data = await read_pdf(file)
     deadline = asyncio.get_running_loop().time() + JOB_TIMEOUT
-    parts = await read_parts(data, deadline)
-    body, pages = await engine(analyze_job, data, previews, parts, deadline=deadline)
+    parts, long = await read_parts(data, deadline)
+    body, pages = await engine(analyze_job, data, previews, parts, deadline=deadline, long=long)
     request.state.log = {"pages": pages, "previews": previews}
     return Response(body, media_type="application/json")
 
@@ -433,8 +521,8 @@ async def edit(request: Request, file: UploadFile = File(...), changes: str = Fo
     data = await read_pdf(file)
     files = await read_images(images)
     deadline = asyncio.get_running_loop().time() + JOB_TIMEOUT
-    parts = await read_parts(data, deadline, changed_pages(changes))
-    out, warnings, counts = await engine(edit_job, data, changes, files, parts, deadline=deadline)
+    parts, long = await read_parts(data, deadline, changed_pages(changes))
+    out, warnings, counts = await engine(edit_job, data, changes, files, parts, deadline=deadline, long=long)
     request.state.log = {**counts, "warnings": len(warnings), "bytesOut": len(out)}
     name = (file.filename or "document.pdf").rsplit(".", 1)[0]
     return Response(out, media_type="application/pdf", headers={
@@ -525,7 +613,7 @@ def index():
 # Every error has the same shape: {"error": {"code", "message", "requestId"}}
 # --------------------------------------------------------------------------- #
 ERROR_CODES = {400: "BAD_REQUEST", 401: "UNAUTHORIZED", 404: "NOT_FOUND", 405: "METHOD_NOT_ALLOWED",
-               413: "FILE_TOO_LARGE", 422: "PDF_REJECTED", 429: "RATE_LIMITED", 503: "BUSY"}
+               413: "FILE_TOO_LARGE", 422: "PDF_REJECTED", 429: "RATE_LIMITED", 503: "BUSY", 504: "TIMEOUT"}
 
 
 @app.exception_handler(StarletteHTTPException)

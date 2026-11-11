@@ -420,8 +420,9 @@ async function call(path, form) {
       continue;
     }
     if (res.ok) return res;
-    let msg = "";
-    try { msg = (await res.json()).error.message; } catch {}
+    let msg = "", code = "";
+    try { ({ message: msg, code } = (await res.json()).error); } catch {}
+    if (code === "TIMEOUT" && msg) throw new Error(msg);   // the PDF itself took too long: retrying won't help
     if (res.status === 413) throw new Error(`This file is too large. ${msg}`);
     if (res.status === 422 && msg) throw new Error(msg);
     if (res.status === 429) throw new Error("Too many requests in a short time. Please wait a moment and try again.");

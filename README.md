@@ -56,7 +56,10 @@ docker run -p 8080:8080 pdf-editor
 | `ALLOWED_ORIGINS` | `*` | Websites allowed to call the API (CORS), comma-separated |
 | `MAX_FILE_MB` / `MAX_PAGES` | `30` / `200` | Limits |
 | `WORKERS` | `1` | PDFs processed at the same time (engine processes) |
-| `SPLIT_PAGES` | `16` | With `WORKERS` > 1, a PDF of at least twice this many pages is read by several engines at once (same result, faster); `0` = never split |
+| `SPLIT_PAGES` | `16` | With `WORKERS` > 1, a long document is read by up to `SPLIT_MAX_PARTS` free engines at once, at least this many pages each; `0` = never split |
+| `SPLIT_MAX_PARTS` | `3` | Most engines one long document may use at once |
+| `RESERVED_ENGINES` | `2` | Engines that work for long documents never take, so short documents always find one free |
+| `LONG_PAGES` | `32` | From this many pages a document counts as long |
 | `RATE_LIMIT_PER_MIN` | `0` (off) | Requests per minute per client IP |
 | `SERVE_UI` | `1` | `0` hides the test page |
 
