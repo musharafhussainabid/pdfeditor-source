@@ -541,7 +541,7 @@ def _pick_font(doc, font_page, style, text, cache):
     if key not in cache:
         cache[key] = load_embedded_font(doc, font_page, style["font"])
     emb = cache[key]
-    if emb and covers(emb["font"]) and metrics_match(emb["font"], font_page, style["font"], cache):
+    if emb and covers(emb["font"]) and embedded_ok(emb["font"], font_page, style["font"], needed, cache):
         return {"font": emb["font"], "kind": "buf", "ref": emb["buf"], "alias": emb["alias"]}
 
     path = find_system_font(style["font"])
@@ -581,6 +581,58 @@ def pdf_advances(page, fontname, cache):
     return cache[key]
 
 
+def drawn_chars(page, fontname, cache):
+    """Every character the page draws in `fontname` (last letters of words included)."""
+    key = ("drawn", page.xref, fontname)
+    if key not in cache:
+        cache[key] = {c["c"] for b in rawdict(page)["blocks"] for l in b.get("lines", [])
+                      for sp in l["spans"] if sp["font"] == fontname for c in sp["chars"]}
+    return cache[key]
+
+
+def embedded_ok(font, page, fontname, needed, cache):
+    """May new text be written with the PDF's own embedded font? Only with evidence that each letter
+    comes out right. Embedded fonts are often cut down to the letters the document uses, or map
+    letters to the wrong shapes (symbol fonts, some Word and Canva subsets): written with them, new
+    text shows as wrong letters. So:
+      - its widths must match how the page spaces its text (metrics_match), and every needed letter
+        the page already draws must match on its own;
+      - a letter the page never draws in it is allowed only when the font has proven itself on at
+        least 4 letters, and the letter has a real shape in the font (not an empty one)."""
+    adv = pdf_advances(page, fontname, cache)
+    diffs = {c: a - font.glyph_advance(ord(c)) for c, a in adv.items() if font.has_glyph(ord(c))}
+    if len(diffs) >= 4:
+        mid = median(diffs.values())
+        if median(abs(d - mid) for d in diffs.values()) >= 0.02 or abs(mid) >= 0.15:
+            return False
+    else:
+        mid = 0.0
+    drawn = drawn_chars(page, fontname, cache)
+    for cp in set(needed):
+        c = chr(cp)
+        if c in diffs:
+            if abs(diffs[c] - mid) > 0.05:          # this letter's shape isn't the one the page uses
+                return False
+        elif c not in drawn:
+            if len(diffs) < 4:
+                return False                        # too little evidence that the font maps letters right
+            if not has_shape(font, cp):
+                return False                        # cut out of the subset: it would draw nothing
+    return True
+
+
+def has_shape(font, cp):
+    """Does the font itself (no fallback font) draw something for this character?"""
+    try:
+        gid = font.has_glyph(cp)
+        if not gid:
+            return False
+        r = fitz.mupdf.fz_bound_glyph(font.this, gid, fitz.mupdf.FzMatrix())
+        return r.x1 - r.x0 > 1e-3 and r.y1 - r.y0 > 1e-3
+    except Exception:
+        return False
+
+
 def metrics_match(font, page, fontname, cache):
     """Do this font's character widths agree with how the PDF spaces its text?
     A constant difference (letter spacing) is fine; inconsistent widths mean the
@@ -593,21 +645,202 @@ def metrics_match(font, page, fontname, cache):
     return median(abs(d - mid) for d in diffs) < 0.02 and abs(mid) < 0.15
 
 
+BASE14_FONTS = {"helv": "Helvetica", "heit": "Helvetica-Oblique", "hebo": "Helvetica-Bold",
+                "hebi": "Helvetica-BoldOblique", "cour": "Courier", "coit": "Courier-Oblique",
+                "cobo": "Courier-Bold", "cobi": "Courier-BoldOblique", "tiro": "Times-Roman",
+                "tiit": "Times-Italic", "tibo": "Times-Bold", "tibi": "Times-BoldItalic"}
+
+
+def pdf_get(doc, xref, path):
+    """doc.xref_get_key along a path like "Resources/Font/F1", following indirect objects at every
+    step (PyMuPDF's own path lookup stops at them). Returns (kind, value) like xref_get_key."""
+    prefix, keys = "", path.split("/")
+    for i, k in enumerate(keys):
+        kind, val = doc.xref_get_key(xref, prefix + k)
+        if i == len(keys) - 1:
+            return kind, val
+        if kind == "xref":
+            xref, prefix = int(val.split()[0]), ""
+        elif kind == "dict":
+            prefix += k + "/"
+        else:
+            return "null", "null"
+
+
+def _resources_owner(doc, xref):
+    """(xref, path prefix) where an object's resources dictionary lives: its own /Resources, or the one
+    a page inherits from the page tree; (None, None) when there is none."""
+    for _ in range(64):
+        kind, val = doc.xref_get_key(xref, "Resources")
+        if kind == "xref":
+            return int(val.split()[0]), ""
+        if kind == "dict":
+            return xref, "Resources/"
+        kind, val = doc.xref_get_key(xref, "Parent")
+        if kind != "xref":
+            return None, None
+        xref = int(val.split()[0])
+    return None, None
+
+
+def font_in(doc, xref, name):
+    """The font object named `name` in the resources of page or form `xref` (inherited ones too), or 0."""
+    owner, prefix = _resources_owner(doc, xref)
+    if owner is None:
+        return 0
+    kind, val = pdf_get(doc, owner, prefix + "Font/" + name)
+    return int(val.split()[0]) if kind == "xref" else 0
+
+
+def own_font(page, name):
+    """The xref of font `name` in the page's resources (not inside a Form XObject), or 0."""
+    try:
+        return font_in(page.parent, page.xref, name)
+    except Exception:
+        return 0
+
+
+def _add_own_font(page, name, xref):
+    """Put font object `xref` into the page's resources under `name`."""
+    doc = page.parent
+    ref = f"{xref} 0 R"
+    kind, val = doc.xref_get_key(page.xref, "Resources")
+    if kind == "xref":
+        owner, prefix = int(val.split()[0]), ""
+    elif kind == "dict":
+        owner, prefix = page.xref, "Resources/"
+    else:                                            # inherited or none: give the page its own copy
+        src, sp = _resources_owner(doc, page.xref)
+        if src is None:
+            doc.xref_set_key(page.xref, "Resources", "<<>>")
+        else:
+            text = doc.xref_object(src, compressed=True) if sp == "" else \
+                "<<" + "".join(f"/{k} {doc.xref_get_key(src, 'Resources/' + k)[1]}"
+                               for k in ("Font", "XObject", "ExtGState", "ColorSpace", "Pattern", "Shading", "ProcSet", "Properties")
+                               if doc.xref_get_key(src, "Resources/" + k)[0] != "null") + ">>"
+            doc.xref_set_key(page.xref, "Resources", text)
+        owner, prefix = page.xref, "Resources/"
+    fkind, fval = doc.xref_get_key(owner, prefix + "Font")
+    if fkind == "xref":
+        doc.xref_set_key(int(fval.split()[0]), name, ref)
+    elif fkind == "dict":
+        doc.xref_set_key(owner, prefix + "Font/" + name, ref)
+    else:
+        doc.xref_set_key(owner, prefix + "Font", f"<</{name} {ref}>>")
+
+
 def use_font(page, choice, style, registered):
-    """Make sure the chosen font is available on `page`; return its name there."""
+    """Make sure the chosen font is in the page's own resources; return its name there.
+
+    Never trusts a name only because it was seen before: rebuilding a page (moving content for
+    new list items) replaces its resources, and the old content is kept as Form XObjects. Those
+    can hold a font of the same name (a PDF this editor edited before), which PyMuPDF then takes
+    for ours without adding it to the page: the new text would point at a missing font and show
+    as wrong letters in every viewer. So the name is checked in the page's own resources every
+    time, and a name already used anywhere on the page gets a fresh one."""
+    reg = registered.setdefault(page.xref, {})
     if choice["kind"] == "base14":
-        return choice["alias"]
-    reg = registered.setdefault(page.xref, set())
-    if choice["alias"] not in reg:
+        return _use_base14(page, choice["alias"])
+    name = reg.get(choice["alias"])
+    if name and own_font(page, name):
+        return name
+    taken = {f[4] for f in page.get_fonts(full=True)}
+    name, n = choice["alias"], 0
+    while name in taken:
+        n += 1
+        name = f"{choice['alias']}n{n}"
+    try:
+        if choice["kind"] == "buf":
+            page.insert_font(fontname=name, fontbuffer=choice["ref"])
+        else:
+            page.insert_font(fontname=name, fontfile=choice["ref"])
+    except Exception:
+        name = None
+    if not name or not own_font(page, name):
+        return _use_base14(page, base14_for(style["font"], style["flags"]))
+    reg[choice["alias"]] = name
+    return name
+
+
+def _use_base14(page, name):
+    """A standard PDF font in the page's own resources under its usual name (helv, tiro...)."""
+    if not own_font(page, name):
+        page.insert_font(fontname=name)
+        if not own_font(page, name):                 # the name is taken inside the page's old content
+            doc = page.parent
+            xref = doc.get_new_xref()
+            doc.update_object(xref, f"<</Type/Font/Subtype/Type1/BaseFont/{BASE14_FONTS[name]}"
+                                    "/Encoding/WinAnsiEncoding>>")
+            _add_own_font(page, name, xref)
+    return name
+
+
+_XOBJ_REF = re.compile(r"/[^\s/<>\[\]]+\s+(\d+)\s+0\s+R")
+_TOKENS = re.compile(rb"\((?:\\.|[^\\()])*\)|<[0-9A-Fa-f\s]*>|/[^\s/\[\]()<>{}%]+|[-+]?\d*\.?\d+|[A-Za-z'\"*]+|%[^\r\n]*")
+
+
+def fonts_drawn(stream):
+    """Font names a content stream really draws text with (a Tf followed by text). A Tf left behind
+    with no text after it (redaction leaves those) draws nothing and doesn't count."""
+    used, current, last_name, has_text = set(), None, None, False
+    for tok in _TOKENS.findall(stream or b""):
+        c = tok[:1]
+        if c == b"/":
+            last_name = tok[1:]
+        elif c == b"(":
+            has_text = has_text or len(tok) > 2
+        elif c == b"<":
+            has_text = has_text or bool(tok[1:-1].strip())
+        elif c == b"%" or c.isdigit() or c in b"+-.":
+            continue
+        else:                                        # an operator
+            if tok == b"Tf":
+                current = last_name
+            elif tok in (b"Tj", b"TJ", b"'", b'"') and has_text and current:
+                used.add(current.decode("latin-1"))
+            has_text = False
+    return used
+
+
+def missing_fonts(doc, pages=None):
+    """Fonts that text uses but that aren't defined where it is drawn: [(page number, font name)].
+    Such text shows as wrong letters, so a save that adds any is refused rather than returned.
+    pages: page numbers to check (default all)."""
+    out = []
+
+    def check(streams, owner, pno, seen):
+        names = set()
+        for x in streams:
+            names |= fonts_drawn(doc.xref_stream(x))
+        for n in sorted(names):
+            if not font_in(doc, owner, n):
+                out.append((pno, n))
+        res, prefix = _resources_owner(doc, owner)
+        if res is None:
+            return
+        kind, xo = pdf_get(doc, res, prefix + "XObject")
+        if kind == "xref":
+            xo = doc.xref_object(int(xo.split()[0]))
+        elif kind != "dict":
+            return
+        for num in _XOBJ_REF.findall(xo):
+            num = int(num)
+            if num not in seen and doc.xref_get_key(num, "Subtype")[1] == "/Form":
+                seen.add(num)
+                has_own = doc.xref_get_key(num, "Resources")[0] != "null"
+                check([num], num if has_own else owner, pno, seen)
+
+    for pno in (range(doc.page_count) if pages is None else sorted(p for p in pages if 0 <= p < doc.page_count)):
+        page = doc[pno]
         try:
-            if choice["kind"] == "buf":
-                page.insert_font(fontname=choice["alias"], fontbuffer=choice["ref"])
-            else:
-                page.insert_font(fontname=choice["alias"], fontfile=choice["ref"])
+            check(page.get_contents(), page.xref, pno, set())
         except Exception:
-            return base14_for(style["font"], style["flags"])
-        reg.add(choice["alias"])
-    return choice["alias"]
+            pass                                     # never fail a save over this check itself
+    return out
+
+
+class BrokenOutput(Exception):
+    """The edited PDF would not show correctly; refused instead of returned."""
 
 
 def write_text(page, x, y, text, style, choice, fc, size=None, right=False):
@@ -649,7 +882,7 @@ def _write_plain(page, x, y, text, style, choice, fc, size):
     fontname = use_font(page, choice, style, fc["registered"])
     page.insert_text((x, y), text, fontsize=size, fontname=fontname,
                      color=int_to_rgb(style["color"]))
-    if choice["kind"] in ("buf", "file") and fontname == choice["alias"]:
+    if choice["kind"] in ("buf", "file") and fontname not in BASE14_FONTS:
         used = fc.setdefault("used", {}).setdefault((page.xref, fontname), [choice, set()])
         used[1].update(text)
 
@@ -688,11 +921,13 @@ def fix_tounicode(doc, fc):
     actually written win; otherwise the lowest code point (the ordinary character)."""
     by_font = {}
     pages = {doc.page_xref(i): i for i in range(doc.page_count)}
-    for (pxref, alias), (choice, chars) in (fc.get("used") or {}).items():
+    first_new = fc.get("first_new_xref", 0)      # objects from here on were made by this save
+    for (pxref, name), (choice, chars) in (fc.get("used") or {}).items():
         if pxref not in pages:
             continue
+        # ours and its copies inside moved content (made by this save), never an older same-named font
         for f in doc[pages[pxref]].get_fonts(full=True):
-            if f[4] == alias and f[2] == "Type0":
+            if f[4] == name and f[2] == "Type0" and f[0] >= first_new:
                 entry = by_font.setdefault(f[0], [choice, set()])
                 entry[1] |= chars
     for fxref, (choice, chars) in by_font.items():
@@ -3217,6 +3452,12 @@ def apply_changes(pdf_bytes, info, edits, inserts, additions=(), objects=(), era
     info = json.loads(json.dumps(info))  # never mutate the stored analysis
     doc = fitz.open("pdf", pdf_bytes)
     fc, warnings = new_font_context(), []
+    fc["first_new_xref"] = doc.xref_length()      # objects from here on are made by this save
+    # pages this save may change (inserted items can push content onto the next page)
+    touched = {int(x["page"]) for x in list(edits) + list(inserts) + list(additions) + list(objects) + list(erase)}
+    touched |= {int(x["to_page"]) for x in objects if "to_page" in x}
+    touched |= {p + 1 for p in touched}
+    broken_before, pages_before = set(missing_fonts(doc, touched)), doc.page_count
     # first, while everything is where /analyze saw it
     pictures = apply_objects(doc, info, objects, erase, warnings) if (objects or erase) else []
     info["_by_xref"] = {doc.page_xref(i): info["pages"][i] for i in range(doc.page_count)}
@@ -3269,6 +3510,11 @@ def apply_changes(pdf_bytes, info, edits, inserts, additions=(), objects=(), era
     out = doc.tobytes(garbage=4, deflate=True)
     pages = doc.page_count
     doc.close()
+    check = fitz.open("pdf", out)
+    broken = set(missing_fonts(check, touched | set(range(pages_before, check.page_count)))) - broken_before
+    check.close()
+    if broken:
+        raise BrokenOutput(f"edited text would use fonts missing from the page: {sorted(broken)}")
     return out, pages, warnings
 
 

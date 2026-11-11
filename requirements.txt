@@ -4,6 +4,9 @@ pymupdf==1.28.2
 fastapi==0.146.0
 uvicorn==0.54.0
 python-multipart==0.0.32
+# Shrinks the fonts embedded in saved PDFs (PyMuPDF's subset_fonts needs it; without it saved files
+# with Chinese, Urdu or Hindi text carry whole fonts, several MB). MIT licence.
+fonttools==4.61.1
 
 # Installed by the packages above (pinned too, for repeatable builds)
 annotated-doc==0.0.5
