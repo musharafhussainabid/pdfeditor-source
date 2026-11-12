@@ -361,14 +361,65 @@ BASE14 = {
 }
 
 
+# Serif or sans, by family name. The PDF's own "serif" flag is a poor guide: some makers (macOS
+# Quartz, used by Word on Mac) set it on every font, so Calibri or Segoe UI would become Times.
+SERIF_FAMILIES = ("times", "georgia", "cambria", "caladea", "garamond", "palatino", "palatia", "book antiqua",
+                  "bookman", "baskerville", "didot", "bodoni", "merriweather", "playfair", "lora", "constantia",
+                  "schoolbook", "minion", "charter", "crimson", "sabon", "cormorant", "abril", "slab",
+                  "rockwell", "perpetua", "goudy", "caslon", "tinos", "gelasio", "domine", "spectral", "alegreya",
+                  "libre caslon", "librecaslon", "frank ruhl", "lusitana", "cardo", "bitter", "arvo", "trajan",
+                  "ebgaramond", "sourceserif", "notoserif", "ptserif", "dejavuserif", "liberationserif")
+SANS_FAMILIES = ("arial", "helvetica", "calibri", "carlito", "segoe", "verdana", "tahoma", "trebuchet", "gill",
+                 "futura", "franklin", "gothic", "avenir", "roboto", "opensans", "open sans", "lato", "montserrat",
+                 "poppins", "raleway", "inter", "nunito", "ubuntu", "myriad", "frutiger", "univers", "candara",
+                 "corbel", "aptos", "oswald", "rubik", "manrope", "barlow", "mulish", "quicksand", "karla",
+                 "fira", "heebo", "hind", "cabin", "dosis", "exo", "josefin", "kanit", "mukta", "oxygen", "prompt",
+                 "titillium", "work", "arimo", "selawik", "leelawadee", "nirmala", "yu gothic", "meiryo",
+                 "malgun", "microsoft", "liberationsans", "dejavusans", "notosans", "ptsans", "sourcesans",
+                 "sf pro", "sfpro", "sfui", "neue", "grotesk", "grotesque", "geneva", "lucida grande", "optima")
+_font_class = {}          # font name -> "ti" / "he", read from the font file itself (see note_font_class)
+
+
+def note_font_class(fontname, buf):
+    """Remember whether an embedded font is serif or sans, from its own file: the OS/2 table's family
+    class and PANOSE serif style say so in any TrueType/OpenType font."""
+    if not buf or fontname in _font_class:
+        return
+    if len(_font_class) > 5000:          # engines run for days: keep the memory bounded
+        _font_class.clear()
+    try:
+        import io
+        from fontTools.ttLib import TTFont
+        os2 = TTFont(io.BytesIO(buf), lazy=True)["OS/2"]
+        cls = os2.sFamilyClass >> 8
+        pan = os2.panose
+        if cls == 8 or (pan.bFamilyType == 2 and pan.bSerifStyle in (11, 12, 13)):
+            _font_class[fontname] = "he"
+        elif cls in (1, 2, 3, 4, 5, 7) or (pan.bFamilyType == 2 and 2 <= pan.bSerifStyle <= 10):
+            _font_class[fontname] = "ti"
+    except Exception:
+        pass                  # no fontTools, a bare CFF font, no OS/2 table: decide by name instead
+
+
 def base14_for(fontname: str, flags: int) -> str:
-    """Closest standard PDF font for an original font name + span flags."""
+    """Closest standard PDF font for an original font name + span flags.
+    Serif or sans: the family name first, then the font file's own description (note_font_class),
+    and the PDF's serif flag only when neither knows."""
     n = fontname.lower()
+    key = re.sub(r"[^a-z]", "", n.split("+")[-1])
     bold = bool(flags & 16) or any(w in n for w in ("bold", "black", "heavy", "semibold"))
     italic = bool(flags & 2) or "italic" in n or "oblique" in n
-    if flags & 8 or "courier" in n or "mono" in n:
+    if "courier" in n or "mono" in n or "consola" in n or "menlo" in n or (flags & 8 and "sans" not in n):
         family = "co"
-    elif (flags & 4 or "times" in n or "serif" in n) and "sans" not in n:
+    elif "sans" in key:
+        family = "he"
+    elif any(s.replace(" ", "") in key for s in SERIF_FAMILIES):
+        family = "ti"
+    elif any(s.replace(" ", "") in key for s in SANS_FAMILIES):
+        family = "he"
+    elif fontname in _font_class:
+        family = _font_class[fontname]
+    elif flags & 4 or "serif" in n:
         family = "ti"
     else:
         family = "he"
@@ -383,6 +434,7 @@ def load_embedded_font(doc, page, basefont):
         try:
             _n, _e, _t, buf = doc.extract_font(xref)
             if buf:
+                note_font_class(basefont, buf)       # serif or sans, for when another font must stand in
                 return {"buf": buf, "font": em.EmojiFont(fitz.Font(fontbuffer=buf)), "alias": f"E{xref}"}
         except Exception:
             pass
@@ -1959,7 +2011,10 @@ def _bounds(lines, extent, vedges, spans, body_left, body_right):
         right_v = [x for x, y0, y1 in here_v if y0 <= cy <= y1 and x >= lx1 - 0.5]
         left_v = [x for x, y0, y1 in here_v if y0 <= cy <= y1 and x <= lx0 + 0.5]
         gap = lx0 - max(left_v) if left_v else None
-        vpad = gap if gap is not None and gap <= 3 * sz else 4.0
+        # a cell's padding: text that close to the border on its left keeps as much room on its right.
+        # Capped at half an inch: at 48 pt, "3 x size" took a name 120 pt from the page edge for a
+        # cell's padding and left it no room to grow (a CV's name next to the photo was shrunk).
+        vpad = gap if gap is not None and gap <= min(3 * sz, 36.0) else 4.0
         if right_v:
             rc.append(min(right_v) - vpad)
         if left_v:

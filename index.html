@@ -1172,7 +1172,14 @@ function showObjBar() {
 }
 
 // ---------- format bar: shows the style of the text you click, edits text boxes ---
-const fontKey = name => { const f = name.split("+").pop().split(/[-,]/)[0]; return f.replace(/(PSMT|MT|PS)$/, "") || f; };
+// Free fonts with the same letter widths as Microsoft's, used by the server when the PDF's own font
+// can't write new letters: shown under the name people know (an edited Calibri line stays "Calibri").
+const TWINS = { Carlito: "Calibri", Caladea: "Cambria", LiberationSans: "Arial", LiberationSerif: "TimesNewRoman",
+                LiberationMono: "CourierNew", Arimo: "Arial", Tinos: "TimesNewRoman", Cousine: "CourierNew" };
+const fontKey = name => {
+  const f = name.split("+").pop().split(/[-,]/)[0], k = f.replace(/(PSMT|MT|PS)$/, "") || f;
+  return TWINS[k.replace(/\s/g, "")] || k;
+};
 const prettyFont = name => fontKey(name).replace(/([a-z])([A-Z])/g, "$1 $2");
 const isBold = l => l.bold || /bold|black|heavy/i.test(l.font.split("+").pop());
 const isItalic = l => l.italic || /italic|oblique/i.test(l.font.split("+").pop());
