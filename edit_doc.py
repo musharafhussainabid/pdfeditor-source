@@ -2260,10 +2260,50 @@ def _edit_runs(line, text):
     return out or [(text, base)]
 
 
-def write_line(doc, page, line, text, fc, keep_styles=True):
+def justified_edge(lines, para):
+    """The right edge a justified paragraph's lines are spread to, or None. Justified when two or more
+    lines before its last end on the same right edge (ragged text doesn't, by chance) and start together."""
+    if len(para) < 3:
+        return None
+    body = [lines[j] for j in para[:-1]]
+    rights = [l["tbox"][2] for l in body]
+    if max(rights) - min(rights) > 1.0 or max(l["x"] for l in body) - min(l["x"] for l in body) > 1.0:
+        return None
+    if any(l.get("rtl") or l.get("align", "left") != "left" for l in body):
+        return None
+    return max(rights)
+
+
+def _justify(doc, page, line, text, fc, edge):
+    """Write a line spread from its start to `edge` (a justified paragraph's lines); False when it can't
+    be done well (mixed styles, a single word, gaps that would be squeezed or far too wide)."""
+    runs = _edit_runs(line, text)
+    words = text.split()
+    if len(runs) != 1 or len(words) < 2:
+        return False
+    st = runs[0][1]
+    choice = choose_font(doc, page, st, text, fc["cache"])
+    font, size = choice["font"], st["size"]
+    widths = [font.text_length(w, fontsize=size) for w in words]
+    space = font.text_length(" ", fontsize=size) or 0.25 * size
+    gap = (edge - line["origin"][0] - sum(widths)) / (len(words) - 1)
+    # wider gaps would read back as separate pieces (see _segments): such a line stays left-aligned
+    if gap < 0.8 * space or gap > min(4 * space, (CELL_GAP - 0.15) * size):
+        return False
+    x = line["origin"][0]
+    for w, wd in zip(words, widths):
+        write_text(page, x, line["origin"][1], w, st, choice, fc, size=size)
+        x += wd + gap
+    return True
+
+
+def write_line(doc, page, line, text, fc, keep_styles=True, justify_to=None):
     """Write text on a line's baseline with its alignment and (where the text is
     unchanged) its original mixed styles; shrinks only if even a single
-    unbreakable piece can't fit its column."""
+    unbreakable piece can't fit its column. justify_to: spread the words to this right edge
+    (a line of a justified paragraph that isn't its last)."""
+    if justify_to and keep_styles and _justify(doc, page, line, text, fc, justify_to):
+        return
     runs = _edit_runs(line, text) if keep_styles else [(text, _style_of(line))]
     parts = []
     for t, st in runs:
@@ -2397,7 +2437,20 @@ def _basic_join(lines, A, B):
     if not words:
         return False
     first = (bx1 - bx0) * len(words[0]) / max(len(B["text"]), 1)
-    room = A.get("right", ax1) - A.get("left", A["x"])
+    # A's room runs from where its lines start: for left-aligned or justified lines (B starts where A
+    # does) that is A's own left edge, not its column's left limit, which can lie well to the left
+    # (a CV column 47 pt from its divider looked half empty, so each line became its own paragraph)
+    # Only in text columns at least 6 em wide and not for code: in a narrow table cell any short word
+    # would look like a full line, and code lines don't flow into each other.
+    mono = bool(A["flags"] & 8) or any(k in A["font"].lower() for k in ("mono", "courier", "consola", "menlo"))
+    own = A.get("right", ax1) - A["x"]
+    if not mono and own >= 6 * sz and abs(row_left - B["x"]) <= 1.5:
+        start = row_left                 # B starts under A's row (a label on A's row, or A itself)
+    elif not mono and own >= 6 * sz and abs(A["x"] - B["x"]) <= 1.5:
+        start = A["x"]
+    else:
+        start = A.get("left", A["x"])
+    room = A.get("right", ax1) - start
     used = (ax1 - row_left) if abs(row_left - B["x"]) <= 1.5 else (ax1 - ax0)
     return used + 0.3 * sz + first > room
 
@@ -2421,7 +2474,13 @@ def _joins(lines, a, b):
     A, B = lines[a], lines[b]
     if not _basic_join(lines, A, B):
         return False
+    # a full line ending mid-sentence, then a line starting in lower case: one sentence going on.
+    # Another column that happens to line up with it (a CV's contact details) doesn't end it.
     sz = A["size"]
+    mono = bool(A["flags"] & 8) or any(k in A["font"].lower() for k in ("mono", "courier", "consola", "menlo"))
+    if (B["text"][:1].islower() and not A["text"].rstrip().endswith((".", ":", ";", "!", "?", ",", "{", "(", "["))
+            and not mono and A.get("right", A["bbox"][2]) - A["x"] >= 6 * sz):
+        return True
     fresh = 0
     for o in lines:
         if o is B or abs(o["origin"][1] - B["origin"][1]) > 0.3 * sz:
@@ -2576,7 +2635,7 @@ def apply_text_edits(doc, info, edits, fc, warnings, growth):
                    if lines[i]["editable"] and (t != lines[i]["text"] or (i in styled and t))}
         if not changed:
             continue
-        redact, writes, done = set(), [], set()
+        redact, writes, done, justify = set(), [], set(), {}
         for idx in sorted(changed, key=lambda j: lines[j]["origin"][1]):
             if idx in done:
                 continue
@@ -2584,10 +2643,13 @@ def apply_text_edits(doc, info, edits, fc, warnings, growth):
             done |= set(para)
             texts = [changed.get(j, lines[j]["text"]) for j in para]
             edited = [q for q, j in enumerate(para) if j in changed]
+            edge = justified_edge(lines, para)
             if all(para[q] in styled or _fits(doc, page, lines[para[q]], texts[q], fc) for q in edited):
                 for q in edited:
                     redact.add(para[q])
                     writes.append((para[q], texts[q]))
+                    if edge and q < len(para) - 1:
+                        justify[para[q]] = edge
                 continue
             first = edited[0]
             slots = para[first:]
@@ -2598,6 +2660,7 @@ def apply_text_edits(doc, info, edits, fc, warnings, growth):
             wrapped = wrap_widths(full, choice["font"], style["size"], widths)
             redact |= set(slots)
             fit, extra = wrapped[:len(slots)], wrapped[len(slots):]
+            ins_ok = False
             if extra:
                 ins = _growth_insert(pno, lines, para, extra, style)
                 try:
@@ -2606,12 +2669,17 @@ def apply_text_edits(doc, info, edits, fc, warnings, growth):
                     ok = None
                 if ok:
                     growth.append(ins)
+                    ins_ok = True
                 else:
                     fit = fit[:-1] + [" ".join(fit[-1:] + extra)]  # squeeze into the last line
                     warnings.append(f"Page {pno + 1}: no room to add lines below “{fit[0][:30]}…”, "
                                     "so the last line was set smaller to fit.")
-            for j, t in zip(slots, fit + [""] * (len(slots) - len(fit))):
+            filled = fit + [""] * (len(slots) - len(fit))
+            last = max((q for q, t in enumerate(filled) if t), default=-1)
+            for q, (j, t) in enumerate(zip(slots, filled)):
                 writes.append((j, t))
+                if edge and t and (q < last or extra and ins_ok):   # every line but the paragraph's last
+                    justify[j] = edge
         if redact:
             sh.delete_in(page, [lines[j]["bbox"] for j in redact])
             _redact_text(page, [fitz.Rect(lines[j]["bbox"]) for j in redact])
@@ -2622,7 +2690,7 @@ def apply_text_edits(doc, info, edits, fc, warnings, growth):
             if j in styled:
                 write_restyled(doc, info, pno, j, t, styled[j], fc, warnings)
             else:
-                write_line(doc, page, lines[j], t, fc)
+                write_line(doc, page, lines[j], t, fc, justify_to=justify.get(j))
 
 
 def renumber(doc, info, inserts, fc):
@@ -2924,7 +2992,9 @@ def insert_items(doc, orig_bytes, info, ins, models, fc, warnings, dry_run=False
     def gap_ok(top, used_to, x0, x1):
         """May whitespace below `top` be used down to `used_to`? Whitespace at the
         bottom of the page, yes. A gap before more content only if it stays generous
-        (spacing between blocks is part of the design, not free space)."""
+        (spacing between blocks is part of the design, not free space): at most half of it, and at
+        least two paragraph gaps stay, so sections still read apart. (Three paragraph gaps refused a
+        CV's 38 pt section gap for one more line, and the edited text was shrunk instead.)"""
         below = [r.y0 for r in obstacle_rects(model)
                  if r.y0 >= top - EPS and _hov(r, x0, x1)
                  and not any(r is e["rect"] and e["patch"] and r.y0 < top for e in model["draw"])]
@@ -2932,7 +3002,7 @@ def insert_items(doc, orig_bytes, info, ins, models, fc, warnings, dry_run=False
             return True
         yt = min(below)
         g = yt - top
-        return yt - used_to >= max(3 * pgap, 0.5 * g)
+        return yt - used_to >= max(2 * pgap, 0.5 * g)
 
     # --- (a) free space right below the item, in the list's own column -----
     fits_in_row = item.get("row_bottom") is not None and Dm <= 0.01 \
@@ -2981,6 +3051,38 @@ def insert_items(doc, orig_bytes, info, ins, models, fc, warnings, dry_run=False
     if not in_column:
         cx0, cx1 = 0.0, W
 
+    def spread(C, x0, x1):
+        """Room made the way a word processor would within one column: content below C moves down, and
+        each gap further down gives up part of itself (keeping at least half, and two paragraph gaps,
+        so sections still read apart) until the column below stays put. [(cut, taken)], or None."""
+        obs = sorted((r for e_, r in [(None, r) for r in model["text"] + model["img"]]
+                      + [(e, e["rect"]) for e in model["draw"]]
+                      if r.y1 > C + EPS and r.y0 < Y2 - EPS and _hov(r, x0, x1)
+                      and not (e_ is not None and e_["patch"] and r.y0 < C)), key=lambda r: r.y0)
+        gaps, bottom = [], C
+        for r in obs:
+            if r.y0 > bottom + EPS:
+                gaps.append((bottom, r.y0, False))
+            bottom = max(bottom, r.y1)
+        gaps.append((bottom, limit, True))                  # free space at the bottom of the column
+        cuts, need = [], Dm
+        for top, end, last in gaps:
+            if need <= 0.01:
+                break
+            g = end - top
+            cap = (g - 2.0) if last else g - max(2 * pgap, 0.5 * g)
+            if cap <= 0.5:
+                continue
+            take = min(cap, need)
+            # cut in the middle of what stays of the gap: clear of the text above and below it
+            # (a cut just under a line's tight box can still clip the line's full box)
+            cut = top + (2.0 if last else (g - take) / 2)
+            if not crossing(model, cut, x0, x1)[0] or not region_free(model, cut, cut + take, x0, x1):
+                continue
+            cuts.append((cut, take))
+            need -= take
+        return cuts if need <= 0.01 else None
+
     plan = None
     for C in c_cands:  # (b) move only what's between the item and free space below
         ok, patch = crossing(model, C, cx0, cx1)
@@ -2989,6 +3091,14 @@ def insert_items(doc, orig_bytes, info, ins, models, fc, warnings, dry_run=False
             if E is not None:
                 plan = ("shift", C, E, cx0, cx1, patch)
                 break
+    if plan is None and in_column:   # (b2) take a little from several gaps in the column
+        for C in c_cands:
+            ok, patch = crossing(model, C, cx0, cx1)
+            if ok:
+                cuts = spread(C, cx0, cx1)
+                if cuts:
+                    plan = ("spread", C, cuts, cx0, cx1, patch)
+                    break
     if plan is None and in_column:
         raise InsertError(
             f"Page {pno + 1}: couldn't add items after “{_item_label(info, pno, item)}”. "
@@ -3033,6 +3143,25 @@ def insert_items(doc, orig_bytes, info, ins, models, fc, warnings, dry_run=False
                        (fitz.Rect(x1, C, W, Y2), 0), (fitz.Rect(x0, C, x1, E), Dm),
                        (fitz.Rect(x0, E + Dm, x1, Y2), 0), (fitz.Rect(0, Y2, W, H), 0)]
         placements = [(pxref, r, pxref, dy) for r, dy in regions]
+        patch_ops = [(pxref, C, C, C + Dm, x0, x1, patch)]
+        positions = [(pxref, anchor + L["rel"]) for L in layout]
+    elif plan[0] == "spread":
+        _, C, cuts, x0, x1, patch = plan
+        regions = [(fitz.Rect(0, 0, W, C), 0)]
+        if x0 > 0.01:
+            regions.append((fitz.Rect(0, C, x0, Y2), 0))
+        if x1 < W - 0.01:
+            regions.append((fitz.Rect(x1, C, W, Y2), 0))
+        regions.append((fitz.Rect(0, Y2, W, H), 0))
+        blocks, dy, y = [], Dm, C
+        for cut, take in cuts:                       # each block moves what the gaps below it don't absorb
+            blocks.append((fitz.Rect(x0, y, x1, cut), dy))
+            dy, y = dy - take, cut
+        blocks.append((fitz.Rect(x0, y, x1, Y2), max(dy, 0.0)))
+        # A block moves further than the one below it, so it overlaps that block's (blank) top: draw the
+        # blocks bottom first, so the page colour each slice carries never covers moved text.
+        regions += blocks[::-1]
+        placements = [(pxref, r, pxref, d) for r, d in regions if r.height > 0.01 and r.width > 0.01]
         patch_ops = [(pxref, C, C, C + Dm, x0, x1, patch)]
         positions = [(pxref, anchor + L["rel"]) for L in layout]
     else:
