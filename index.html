@@ -1175,7 +1175,9 @@ function showObjBar() {
 // Free fonts with the same letter widths as Microsoft's, used by the server when the PDF's own font
 // can't write new letters: shown under the name people know (an edited Calibri line stays "Calibri").
 const TWINS = { Carlito: "Calibri", Caladea: "Cambria", LiberationSans: "Arial", LiberationSerif: "TimesNewRoman",
-                LiberationMono: "CourierNew", Arimo: "Arial", Tinos: "TimesNewRoman", Cousine: "CourierNew" };
+                LiberationMono: "CourierNew", Arimo: "Arial", Tinos: "TimesNewRoman", Cousine: "CourierNew",
+                Selawik: "SegoeUI", Gelasio: "Georgia", NimbusSans: "Helvetica", NimbusRoman: "Times",
+                NimbusMonoPS: "Courier", P052: "Palatino", C059: "CenturySchoolbook" };
 const fontKey = name => {
   const f = name.split("+").pop().split(/[-,]/)[0], k = f.replace(/(PSMT|MT|PS)$/, "") || f;
   return TWINS[k.replace(/\s/g, "")] || k;

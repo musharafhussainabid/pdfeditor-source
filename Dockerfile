@@ -2,13 +2,22 @@
 # Cloudflare Containers and AWS Lambda (via the Lambda Web Adapter, which is inactive everywhere else).
 FROM public.ecr.aws/docker/library/python:3.12-slim-bookworm
 COPY --from=public.ecr.aws/awsguru/aws-lambda-adapter:0.8.4 /lambda-adapter /opt/extensions/lambda-adapter
-# Look-alike fonts so new text matches Calibri, Cambria, Arial, Times New Roman, Courier New
+# Fonts for new text when the PDF's own copy can't be used: same-width twins of Calibri, Cambria, Arial,
+# Times New Roman, Courier New (crosextra, liberation), Helvetica, Times, Palatino, Bookman, Century
+# Schoolbook, Avant Garde (urw-base35, texgyre), and free fonts documents use as they are (Open Sans, Lato,
+# Roboto, Inter, EB Garamond, Quicksand, Cantarell), plus Noto for other scripts.
 RUN apt-get update && apt-get install -y --no-install-recommends \
       fonts-crosextra-carlito fonts-crosextra-caladea fonts-liberation fonts-dejavu-core fonts-noto-core \
+      fonts-urw-base35 fonts-texgyre fonts-open-sans fonts-lato fonts-roboto fonts-inter fonts-ebgaramond \
+      fonts-quicksand fonts-cantarell \
  && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
+# More free fonts (Montserrat, Poppins, Raleway, Source Sans 3, Merriweather, Playfair Display, Nunito,
+# Oswald, Work Sans, PT Sans/Serif; Gelasio = Georgia's widths; Selawik = Segoe UI's), pinned and checksum-checked
+COPY tools/get_fonts.py /tmp/get_fonts.py
+RUN python /tmp/get_fonts.py /usr/local/share/fonts/pdf-edit && rm /tmp/get_fonts.py
 # Emoji pictures (Twemoji 15.0, pinned and checksum-checked): emoji in edited text are drawn in colour
 COPY tools/get_emoji.py /tmp/get_emoji.py
 RUN python /tmp/get_emoji.py /app/emoji && rm /tmp/get_emoji.py

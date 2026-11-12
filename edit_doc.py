@@ -468,6 +468,8 @@ def system_fonts():
                 for fn in files:
                     if not fn.lower().endswith((".ttf", ".otf")):
                         continue
+                    if "variable" in fn.lower() or "[" in fn:
+                        continue        # one file for every weight: a PDF would draw it in one weight only
                     path = os.path.join(root, fn)
                     try:
                         name = fitz.Font(fontfile=path).name
@@ -480,28 +482,68 @@ def system_fonts():
 
 # Free fonts with the same letter widths as common Microsoft/Adobe fonts, so text
 # still lines up on servers that don't have the originals installed (Linux VPS).
+# Each twin is drawn the same width as the original (most are made as drop-in replacements). The first
+# match wins, so specific names come before general ones. Twins that differ in width are still checked
+# by metrics_match before use.
 METRIC_TWINS = [
     ("timesnewroman", "liberationserif"), ("timesnew", "liberationserif"), ("couriernew", "liberationmono"),
-    ("arialnarrow", "liberationsansnarrow"), ("helvetica", "liberationsans"),
-    ("calibri", "carlito"), ("cambria", "caladea"), ("arial", "liberationsans"),
-    ("times", "liberationserif"), ("courier", "liberationmono"),
+    ("arialnarrow", "liberationsansnarrow"), ("helveticaneue", "liberationsans"), ("helvetica", "nimbussans"),
+    ("helvetica", "liberationsans"), ("calibri", "carlito"), ("cambria", "caladea"), ("arial", "liberationsans"),
+    ("segoeui", "selawik"), ("georgia", "gelasio"), ("sourcesanspro", "sourcesans3"),
+    ("palatinolinotype", "p052"), ("palatino", "p052"), ("bookantiqua", "p052"),
+    ("centuryschoolbook", "c059"), ("newcenturyschlbk", "c059"),
+    ("bookmanoldstyle", "urwbookman"), ("bookman", "urwbookman"),
+    ("centurygothic", "urwgothic"), ("itcavantgarde", "urwgothic"), ("avantgarde", "urwgothic"),
+    ("times", "nimbusroman"), ("times", "liberationserif"), ("courier", "nimbusmonops"), ("courier", "liberationmono"),
 ]
+# The same style under the names other font makers use (URW calls regular "Book" or "Light", bold "Demi").
+STYLE_ALIASES = {"": ["", "regular", "roman", "book", "light", "medium"],
+                 "bold": ["bold", "demi", "bd"], "italic": ["italic", "oblique", "bookoblique", "lightitalic"],
+                 "bolditalic": ["bolditalic", "demiitalic", "demioblique", "bdita", "boldoblique"],
+                 "semibold": ["semibold", "demibold", "demi"], "light": ["light", "semilight"]}
 
 
-def find_system_font(fontname):
-    """The installed file for a PDF font name, or its metric-compatible twin."""
+def find_system_font(fontname, kind=False):
+    """The installed file for a PDF font name, or its metric-compatible twin.
+    kind=True returns (path, "same" or "twin"); (None, None) when there is none."""
     fonts = system_fonts()
     key = _norm(fontname)
     if key in fonts:
-        return fonts[key]
+        return (fonts[key], "same") if kind else fonts[key]
+    # Twins are matched on the whole name: _norm drops endings like "book" or "roman", which are part of
+    # some family names (Century Schoolbook, Nimbus Roman).
+    raw = re.sub(r"[^a-z0-9]", "", fontname.split("+")[-1].lower())
     for src, twin in METRIC_TWINS:
-        if key.startswith(src):
-            style = key[len(src):]
-            style = style[2:] if style.startswith("ps") else style  # TimesNewRomanPS-Bold
-            path = fonts.get(twin + style)
-            if path:
-                return path
-    return None
+        if raw.startswith(src):
+            style = re.sub(r"^ps", "", raw[len(src):])                # TimesNewRomanPS-BoldMT
+            style = re.sub(r"(ps|mt)+$", "", style)
+            style = "" if style in ("regular", "roman", "book", "normal", "plain") else style
+            for alt in STYLE_ALIASES.get(style, [style]):
+                path = fonts.get(twin + alt) or fonts.get(_norm(twin + alt))
+                if path:
+                    return (path, "twin") if kind else path
+    return (None, None) if kind else None
+
+
+def font_label(name):
+    """A font's family as people name it: "AAAAAK+SegoeUI-Bold" -> "Segoe UI"."""
+    fam = re.split(r"[-,]", name.split("+")[-1])[0]
+    fam = re.sub(r"(PSMT|PS|MT)$", "", fam) or fam
+    fam = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", fam)
+    return fam.strip() or name
+
+
+BASE14_LABELS = {"he": "Helvetica", "ti": "Times", "co": "Courier"}
+
+
+def _base14_match(fontname):
+    """How a standard PDF font stands in for `fontname`: the same font, a same-width twin, or another font."""
+    k = _norm(fontname)
+    if k.startswith(("timesnewroman", "timesnew", "couriernew", "arial", "liberation", "nimbus")):
+        return "twin"                   # Helvetica has Arial's widths, Times has Times New Roman's...
+    if k.startswith(("helvetica", "times", "courier", "symbol", "zapf")):
+        return "same"
+    return "stand-in"
 
 
 def default_fallback():
@@ -594,20 +636,24 @@ def _pick_font(doc, font_page, style, text, cache):
         cache[key] = load_embedded_font(doc, font_page, style["font"])
     emb = cache[key]
     if emb and covers(emb["font"]) and embedded_ok(emb["font"], font_page, style["font"], needed, cache):
-        return {"font": emb["font"], "kind": "buf", "ref": emb["buf"], "alias": emb["alias"]}
+        return {"font": emb["font"], "kind": "buf", "ref": emb["buf"], "alias": emb["alias"], "match": "same"}
 
-    path = find_system_font(style["font"])
+    path, how = find_system_font(style["font"], kind=True)
     if path:
         f = font_obj("file", path)
         if covers(f) and metrics_match(f, font_page, style["font"], cache):
-            return {"font": f, "kind": "file", "ref": path, "alias": file_alias(path)}
+            return {"font": f, "kind": "file", "ref": path, "alias": file_alias(path), "match": how}
 
     name = base14_for(style["font"], style["flags"])
     fallback = default_fallback()
     if all(c < 256 for c in needed) or not fallback:
-        return {"font": font_obj("base14", name), "kind": "base14", "ref": name, "alias": name}
+        return {"font": font_obj("base14", name), "kind": "base14", "ref": name, "alias": name,
+                "match": _base14_match(style["font"])}
+    # letters a standard font doesn't have (Greek, Vietnamese...): not a missing font, so no warning;
+    # for a document font that isn't available at all, it is a stand-in
     return {"font": font_obj("file", fallback), "kind": "file", "ref": fallback,
-            "alias": file_alias(fallback)}
+            "alias": file_alias(fallback),
+            "match": "stand-in" if _base14_match(style["font"]) == "stand-in" else "twin"}
 
 
 def pdf_advances(page, fontname, cache):
@@ -895,10 +941,34 @@ class BrokenOutput(Exception):
     """The edited PDF would not show correctly; refused instead of returned."""
 
 
+def note_stand_in(page, style, choice, fc, text):
+    """Remember when new text in a document font had to be written in a different-looking font
+    (no usable copy in the PDF, not installed, no same-width twin): the save says so in a warning."""
+    base = choice.get("base", choice) if choice["kind"] == "shaped" else choice
+    if base.get("match", "same") != "stand-in" or not text.strip() or not style.get("font"):
+        return
+    orig = font_label(style["font"])
+    used = BASE14_LABELS.get(base["alias"][:2]) if base["kind"] == "base14" else None
+    if used is None:
+        try:
+            used = font_label(base["font"].name.replace(" ", ""))
+        except Exception:
+            used = "another font"
+    if orig.replace(" ", "").lower() != used.replace(" ", "").lower():
+        fc.setdefault("stand_ins", {}).setdefault((page.number, orig), used)
+
+
+def stand_in_warnings(fc):
+    """One warning per page and font that had to be replaced by a different-looking one."""
+    return [f"Page {pno + 1}: the font \u201c{orig}\u201d isn't available, so the new text uses {used}, "
+            "the closest available font." for (pno, orig), used in sorted((fc.get("stand_ins") or {}).items())]
+
+
 def write_text(page, x, y, text, style, choice, fc, size=None, right=False):
     """Write text on a baseline; emoji in it are drawn as colour pictures in line with the letters.
     right: the line is anchored at its right edge (a right-to-left line), remembered for the next edit."""
     size = size or style["size"]
+    note_stand_in(page, style, choice, fc, text)
     if choice["kind"] == "shaped":
         _write_shaped(page, x, y, text, style, choice, fc, size, right)
         return
@@ -3228,11 +3298,13 @@ def doc_font_choice(doc, info, src, bold, italic, text, fc):
     flags = (line["flags"] & ~18) | (16 if bold else 0) | (2 if italic else 0)
     suffix = ("Bold" if bold else "") + ("Italic" if italic else "")
     style = {"font": f"{fam}-{suffix}" if suffix else fam, "flags": flags}
-    path = find_system_font(style["font"])
+    path, how = find_system_font(style["font"], kind=True)
     if path:
-        return {"font": font_obj("file", path), "kind": "file", "ref": path, "alias": file_alias(path)}, style
+        return {"font": font_obj("file", path), "kind": "file", "ref": path, "alias": file_alias(path),
+                "match": how}, style
     name = base14_for(fam, flags)
-    return {"font": font_obj("base14", name), "kind": "base14", "ref": name, "alias": name}, style
+    return {"font": font_obj("base14", name), "kind": "base14", "ref": name, "alias": name,
+            "match": _base14_match(fam)}, style
 
 
 def _doc_text(doc, info, page, rect, a, fc, warnings):
@@ -3557,6 +3629,7 @@ def apply_changes(pdf_bytes, info, edits, inserts, additions=(), objects=(), era
     place_pictures(doc, pictures, warnings)
     apply_additions(doc, info, additions, fc, warnings)
     fix_tounicode(doc, fc)
+    warnings += stand_in_warnings(fc)
     if fc.get("shaped"):
         try:
             doc.subset_fonts()          # MuPDF's layout embeds its fonts whole (CJK alone is ~4 MB)
