@@ -522,7 +522,37 @@ def find_system_font(fontname, kind=False):
                 path = fonts.get(twin + alt) or fonts.get(_norm(twin + alt))
                 if path:
                     return (path, "twin") if kind else path
+    path = noto_latin_font(fontname)
+    if path:
+        return (path, "twin") if kind else path
     return (None, None) if kind else None
+
+
+def noto_latin_font(fontname):
+    """Noto fonts for other scripts (Noto Sans Devanagari...) draw Latin letters like Noto Sans / Serif:
+    the installed one, nearest weight. None if the name isn't one or none is installed."""
+    fonts = system_fonts()
+    raw = re.sub(r"[^a-z0-9]", "", fontname.split("+")[-1].lower())
+    m = re.match(r"(notosans|notoserif|notonaskh|notokufi)(" + "|".join(_NOTO_SCRIPTS) + r")(.*)$", raw)
+    if m:
+        latin = "notoserif" if m.group(1) in ("notoserif", "notonaskh") else "notosans"
+        style = re.sub(r"(ui)?(regular)?$", "", m.group(3))
+        italic = "italic" if style.endswith("italic") else ""
+        weight = style[:-6] if italic else style
+        # the nearest weight installed: SemiBold -> Bold, Medium -> Regular...
+        near = {"semibold": ["semibold", "bold"], "extrabold": ["extrabold", "bold"], "black": ["black", "bold"],
+                "medium": ["medium", ""], "light": ["light", ""], "extralight": ["extralight", "light", ""],
+                "thin": ["thin", ""]}.get(weight, [weight, ""])
+        for alt in [w + italic for w in near] + ([italic] if italic else []):
+            path = fonts.get(latin + alt) or fonts.get(_norm(latin + alt))
+            if path:
+                return path
+    return None
+
+
+_NOTO_SCRIPTS = ("devanagari", "bengali", "arabic", "hebrew", "thai", "tamil", "telugu", "kannada", "malayalam",
+                 "gujarati", "gurmukhi", "oriya", "sinhala", "myanmar", "khmer", "lao", "georgian", "armenian",
+                 "ethiopic", "sc", "tc", "jp", "kr", "hk", "cjksc", "cjktc", "cjkjp", "cjkkr")
 
 
 def font_label(name):
@@ -604,6 +634,45 @@ def nastaliq_font(bold):
     return (fonts.get("notonastaliqurdubold") if bold else None) or fonts.get("notonastaliqurdu")
 
 
+# Installed Noto fonts per writing system: (sans family, serif family); keys as in system_fonts()
+SCRIPT_FONTS = {"deva": ("notosansdevanagari", "notoserifdevanagari"), "beng": ("notosansbengali", "notoserifbengali"),
+                "guru": ("notosansgurmukhi", "notoserifgurmukhi"), "gujr": ("notosansgujarati", "notoserifgujarati"),
+                "orya": ("notosansoriya", "notoseriforiya"), "taml": ("notosanstamil", "notoseriftamil"),
+                "telu": ("notosanstelugu", "notoseriftelugu"), "knda": ("notosanskannada", "notoserifkannada"),
+                "mlym": ("notosansmalayalam", "notoserifmalayalam"), "sinh": ("notosanssinhala", "notoserifsinhala"),
+                "thai": ("notosansthai", "notoserifthai"), "laoo": ("notosanslao", "notoseriflao"),
+                "tibt": ("notoseriftibetan", "notoseriftibetan"), "mymr": ("notosansmyanmar", "notoserifmyanmar"),
+                "geor": ("notosansgeorgian", "notoserifgeorgian"), "ethi": ("notosansethiopic", "notoserifethiopic"),
+                "khmr": ("notosanskhmer", "notoserifkhmer"), "armn": ("notosansarmenian", "notoserifarmenian"),
+                "hebr": ("notosanshebrew", "notoserifhebrew"), "arab": ("notosansarabic", "notonaskharabic"),
+                "cjksc": ("notosanscjksc", "notoserifcjksc"), "cjktc": ("notosanscjktc", "notoserifcjktc"),
+                "cjkjp": ("notosanscjkjp", "notoserifcjkjp"), "cjkkr": ("notosanscjkkr", "notoserifcjkkr")}
+
+# Which Chinese/Japanese/Korean version a document font asks for, by its name
+CJK_HINTS = (("tc", ("cjktc", "cjkhk", "sanstc", "seriftc", "mingliu", "pmingliu", "jhenghei", "dfkai", "kaiu", "big5",
+                     "hkscs", "mhei", "msung")),
+             ("jp", ("cjkjp", "sansjp", "serifjp", "mincho", "msgothic", "mspgothic", "yugothic", "meiryo", "hiragino",
+                     "kozuka", "ipaex", "ipagothic", "ipamincho", "takao")),
+             ("kr", ("cjkkr", "sanskr", "serifkr", "malgun", "batang", "gulim", "dotum", "gungsuh", "nanum", "applegothic")),
+             ("sc", ("cjksc", "sanssc", "serifsc", "simsun", "nsimsun", "simhei", "yahei", "songti", "heiti", "kaiti",
+                     "fangsong", "dengxian", "pingfang", "stsong", "stheiti", "stkaiti")))
+
+
+def cjk_hint(fontname):
+    k = re.sub(r"[^a-z]", "", fontname.lower())
+    return next((region for region, words in CJK_HINTS if any(w in k for w in words)), None)
+
+
+def script_font_file(script, serif, bold):
+    """An installed font file for a writing system, sans or serif, regular or bold (None if not installed)."""
+    fams = SCRIPT_FONTS.get(script)
+    if not fams:
+        return None
+    fonts = system_fonts()
+    key = fams[1 if serif else 0] + ("bold" if bold else "")
+    return fonts.get(key)
+
+
 def shaped_choice(base, style):
     """A font choice drawn with MuPDF's layout, `base` being the font for the document's own letters.
     Text that replaces a Nastaliq line (the usual Urdu book style) is drawn in Nastaliq too, when installed."""
@@ -612,9 +681,11 @@ def shaped_choice(base, style):
     nast = nastaliq_font(bold) if sh.is_nastaliq(style["font"]) else None
     # Noto Nastaliq is drawn larger than other Nastaliq fonts at the same size (Jameel Noori: about 1.35x wider)
     scale = 1.0 if not nast or "noto" in style["font"].lower() else 0.75
-    key = (base["kind"], base["alias"], name, nast, scale)
+    hint = cjk_hint(style["font"])
+    key = (base["kind"], base["alias"], name, nast, scale, hint)
     if key not in _shaped:
-        _shaped[key] = sh.ShapedFont(base, sh.GENERIC[name[:2]], bold, italic, nast, scale)
+        _shaped[key] = sh.ShapedFont(base, sh.GENERIC[name[:2]], bold, italic, nast, scale,
+                                     script_files=script_font_file, cjk=hint)
     return {"font": _shaped[key], "kind": "shaped", "ref": None, "alias": base["alias"], "base": base}
 
 
@@ -643,6 +714,12 @@ def _pick_font(doc, font_page, style, text, cache):
         f = font_obj("file", path)
         if covers(f) and metrics_match(f, font_page, style["font"], cache):
             return {"font": f, "kind": "file", "ref": path, "alias": file_alias(path), "match": how}
+    # a Noto font for another script, installed but without these (Latin) letters: its Noto Sans twin
+    path = noto_latin_font(style["font"])
+    if path:
+        f = font_obj("file", path)
+        if covers(f):
+            return {"font": f, "kind": "file", "ref": path, "alias": file_alias(path), "match": "twin"}
 
     name = base14_for(style["font"], style["flags"])
     fallback = default_fallback()
@@ -947,7 +1024,11 @@ def note_stand_in(page, style, choice, fc, text):
     base = choice.get("base", choice) if choice["kind"] == "shaped" else choice
     if base.get("match", "same") != "stand-in" or not text.strip() or not style.get("font"):
         return
+    if choice["kind"] == "shaped" and not any(sh._own_font_char(c) and not c.isspace() for c in em.strip(text)):
+        return                     # every letter is drawn by its script's font: the stand-in isn't used
     orig = font_label(style["font"])
+    if style["font"].startswith("Type3"):      # letters stored as drawings, no font name in the PDF
+        orig = "used in this PDF (stored as drawings)"
     used = BASE14_LABELS.get(base["alias"][:2]) if base["kind"] == "base14" else None
     if used is None:
         try:
@@ -960,8 +1041,10 @@ def note_stand_in(page, style, choice, fc, text):
 
 def stand_in_warnings(fc):
     """One warning per page and font that had to be replaced by a different-looking one."""
-    return [f"Page {pno + 1}: the font \u201c{orig}\u201d isn't available, so the new text uses {used}, "
-            "the closest available font." for (pno, orig), used in sorted((fc.get("stand_ins") or {}).items())]
+    return [(f"Page {pno + 1}: the font {orig} isn't available, so the new text uses {used}, the closest available font."
+             if orig.startswith("used in") else
+             f"Page {pno + 1}: the font \u201c{orig}\u201d isn't available, so the new text uses {used}, "
+             "the closest available font.") for (pno, orig), used in sorted((fc.get("stand_ins") or {}).items())]
 
 
 def write_text(page, x, y, text, style, choice, fc, size=None, right=False):
@@ -3429,11 +3512,15 @@ def doc_font_choice(doc, info, src, bold, italic, text, fc):
     style = {"font": f"{fam}-{suffix}" if suffix else fam, "flags": flags}
     path, how = find_system_font(style["font"], kind=True)
     if path:
-        return {"font": font_obj("file", path), "kind": "file", "ref": path, "alias": file_alias(path),
-                "match": how}, style
-    name = base14_for(fam, flags)
-    return {"font": font_obj("base14", name), "kind": "base14", "ref": name, "alias": name,
-            "match": _base14_match(fam)}, style
+        choice = {"font": font_obj("file", path), "kind": "file", "ref": path, "alias": file_alias(path),
+                  "match": how}
+    else:
+        name = base14_for(fam, flags)
+        choice = {"font": font_obj("base14", name), "kind": "base14", "ref": name, "alias": name,
+                  "match": _base14_match(fam)}
+    if sh.needs_layout(text, choice["font"]):     # letters this font doesn't have (Chinese, Hindi, Arabic...)
+        choice = shaped_choice(choice, style)
+    return choice, style
 
 
 def _doc_text(doc, info, page, rect, a, fc, warnings):
@@ -3706,6 +3793,9 @@ def apply_changes(pdf_bytes, info, edits, inserts, additions=(), objects=(), era
     Returns (edited_pdf_bytes, page_count, warnings).
     """
     info = json.loads(json.dumps(info))  # never mutate the stored analysis
+    # every letter this save may write: large script fonts are cut once for all of them (see script_text)
+    sh.SUBSET_SCOPE.text = json.dumps([[e.get("text") for e in edits], [i.get("items") for i in inserts],
+                                       [a.get("text") for a in additions]], ensure_ascii=False)
     doc = fitz.open("pdf", pdf_bytes)
     fc, warnings = new_font_context(), []
     fc["first_new_xref"] = doc.xref_length()      # objects from here on are made by this save

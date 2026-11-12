@@ -18,6 +18,12 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Oswald, Work Sans, PT Sans/Serif; Gelasio = Georgia's widths; Selawik = Segoe UI's), pinned and checksum-checked
 COPY tools/get_fonts.py /tmp/get_fonts.py
 RUN python /tmp/get_fonts.py /usr/local/share/fonts/pdf-edit && rm /tmp/get_fonts.py
+# Chinese, Japanese, Korean (Noto Sans / Serif CJK, Regular and Bold): taken out of Debian's font collections
+# as separate fonts, then the package is removed again in the same step
+COPY tools/get_cjk.py /tmp/get_cjk.py
+RUN apt-get update && apt-get install -y --no-install-recommends fonts-noto-cjk \
+ && python /tmp/get_cjk.py /usr/share/fonts/opentype/noto /usr/local/share/fonts/pdf-edit \
+ && apt-get purge -y fonts-noto-cjk && rm -rf /var/lib/apt/lists/* /tmp/get_cjk.py
 # Emoji pictures (Twemoji 15.0, pinned and checksum-checked): emoji in edited text are drawn in colour
 COPY tools/get_emoji.py /tmp/get_emoji.py
 RUN python /tmp/get_emoji.py /app/emoji && rm /tmp/get_emoji.py
