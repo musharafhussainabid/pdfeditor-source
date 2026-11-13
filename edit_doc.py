@@ -2039,6 +2039,7 @@ def page_bands(doc, all_lines, image_boxes=None):
             "footer_top": round(min(l["bbox"][1] for l in foot), 2) if foot else None,
             "header_pagenum": any(PAGENUM_RE.match(l["text"]) for l in head),
             "footer_pagenum": any(PAGENUM_RE.match(l["text"]) for l in foot),
+            "body_lines": len(lines) - len(head) - len(foot),
         }
         if body:
             t = min(r.y0 for r in body)
@@ -3294,7 +3295,8 @@ def insert_items(doc, orig_bytes, info, ins, models, fc, warnings, dry_run=False
                 nx = doc.page_xref(idx + 1)
                 npi = info["_by_xref"].get(nx) or models.get(nx, {}).get("band")
                 npg = doc[idx + 1]
-                if (npi and nx in snap and not npg.rotation and abs(npg.rect.width - W) < 0.5
+                if (npi and nx in snap and nx not in info.get("_deleting", ()) and not npg.rotation
+                        and abs(npg.rect.width - W) < 0.5
                         and abs(npg.rect.height - H) < 0.5):
                     nm = get_model(models, npg)
                     hb = npi["header_bottom"] + 0.3 if npi["header_bottom"] else 0.0
@@ -3782,7 +3784,85 @@ def place_pictures(doc, placements, warnings):
             warnings.append(f"Page {p + 1}: an image couldn't be placed, so it was skipped.")
 
 
-def apply_changes(pdf_bytes, info, edits, inserts, additions=(), objects=(), erase=()):
+def delete_pages(pdf_bytes, pages):
+    """The PDF without the given pages (numbers from 0). Bookmarks and links to them go too."""
+    doc = fitz.open("pdf", pdf_bytes)
+    _drop_pages(doc, {doc.page_xref(p) for p in pages})
+    out = doc.tobytes(garbage=4, deflate=True)
+    n = doc.page_count
+    doc.close()
+    return out, n
+
+
+def _drop_pages(doc, xrefs):
+    idx = [i for i in range(doc.page_count) if doc.page_xref(i) in xrefs]
+    if not idx:
+        return
+    # form fields drawn on these pages must leave the document's field list too
+    dead = set()
+    for i in idx:
+        kind, val = doc.xref_get_key(doc.page_xref(i), "Annots")
+        if kind == "xref":                          # the list is an object of its own
+            val = doc.xref_object(int(val.split()[0]), compressed=True)
+        dead |= {int(x) for x in re.findall(r"(\d+) 0 R", val if kind in ("array", "xref") else "")}
+    toc = doc.get_toc(False)
+    doc.delete_pages(idx)                # also removes links to these pages; bookmarks to them are only greyed out
+    gone = {i for i, t in enumerate(toc) if t[2] - 1 in set(idx)}
+    if gone:
+        try:
+            after = doc.get_toc(False)
+            if len(after) == len(toc):
+                kept, level, removed = [], 0, []   # removed: levels of removed bookmarks above this one
+                for i, t in enumerate(after):
+                    while removed and removed[-1] >= t[0]:
+                        removed.pop()
+                    if i in gone:
+                        removed.append(t[0])
+                        continue
+                    t = list(t)
+                    # a removed bookmark's sub-items move up into its place
+                    t[0] = level = max(1, min(t[0] - len(removed), level + 1))
+                    if len(t) > 3 and isinstance(t[3], dict):
+                        t[3] = {k: v for k, v in t[3].items() if k != "xref"}
+                    kept.append(t)
+                doc.set_toc(kept)
+        except Exception:
+            pass
+    if dead:
+        try:
+            _prune_fields(doc, dead)
+        except Exception:
+            pass
+
+
+def _refs(doc, xref, key):
+    kind, val = doc.xref_get_key(xref, key)
+    return [int(x) for x in re.findall(r"(\d+) 0 R", val)] if kind == "array" else None
+
+
+def _prune_fields(doc, dead):
+    """Take the widgets of deleted pages out of /AcroForm /Fields (and out of their parent field's /Kids);
+    a parent field left without kids goes too."""
+    cat = doc.pdf_catalog()
+
+    def prune(xref, key):
+        refs = _refs(doc, xref, key)
+        if refs is None:
+            return None
+        keep = []
+        for x in refs:
+            if x in dead:
+                continue
+            if _refs(doc, x, "Kids") and not prune(x, "Kids"):
+                continue                     # every kid of this field was on a deleted page
+            keep.append(x)
+        if keep != refs:
+            doc.xref_set_key(xref, key, "[" + " ".join(f"{x} 0 R" for x in keep) + "]")
+        return keep
+    prune(cat, "AcroForm/Fields")
+
+
+def apply_changes(pdf_bytes, info, edits, inserts, additions=(), objects=(), erase=(), delete=()):
     """
     Remove/move/replace existing images and erase areas, apply text edits and list insertions,
     then place additions on top.
@@ -3790,9 +3870,22 @@ def apply_changes(pdf_bytes, info, edits, inserts, additions=(), objects=(), era
                  restyles the whole line: font/src, size, bold, italic, color "#rrggbb", each optional)
       inserts:   [{"page", "list", "after", "items"}]   (items: strings; "-" lines are sub-points)
       additions: see apply_additions;  objects, erase: see apply_objects
+      delete:    page numbers to remove (as /analyze numbered them); done last, so every other change
+                 uses the original numbering. Changes on a page being deleted are skipped.
     Returns (edited_pdf_bytes, page_count, warnings).
     """
     info = json.loads(json.dumps(info))  # never mutate the stored analysis
+    delete = set(delete)
+    skipped = set()
+
+    def keep(x):
+        p = {int(x["page"])} | ({int(x["to_page"])} if "to_page" in x else set())
+        if p & delete:
+            skipped.update(p & delete)
+            return False
+        return True
+    edits, inserts, additions = [x for x in edits if keep(x)], [x for x in inserts if keep(x)], [x for x in additions if keep(x)]
+    objects, erase = [x for x in objects if keep(x)], [x for x in erase if keep(x)]
     # every letter this save may write: large script fonts are cut once for all of them (see script_text)
     sh.SUBSET_SCOPE.text = json.dumps([[e.get("text") for e in edits], [i.get("items") for i in inserts],
                                        [a.get("text") for a in additions]], ensure_ascii=False)
@@ -3803,7 +3896,12 @@ def apply_changes(pdf_bytes, info, edits, inserts, additions=(), objects=(), era
     touched = {int(x["page"]) for x in list(edits) + list(inserts) + list(additions) + list(objects) + list(erase)}
     touched |= {int(x["to_page"]) for x in objects if "to_page" in x}
     touched |= {p + 1 for p in touched}
-    broken_before, pages_before = set(missing_fonts(doc, touched)), doc.page_count
+    orig_xrefs = [doc.page_xref(i) for i in range(doc.page_count)]
+    touched = {p for p in touched if p < len(orig_xrefs)}
+    # fonts already missing before this save, by page object (page numbers change when pages go or are added)
+    broken_before = {(orig_xrefs[p], f) for p, f in missing_fonts(doc, touched)}
+    warnings += [f"Page {p + 1} is deleted, so the changes on it were skipped." for p in sorted(skipped)]
+    info["_deleting"] = {orig_xrefs[p] for p in delete}
     # first, while everything is where /analyze saw it
     pictures = apply_objects(doc, info, objects, erase, warnings) if (objects or erase) else []
     info["_by_xref"] = {doc.page_xref(i): info["pages"][i] for i in range(doc.page_count)}
@@ -3847,6 +3945,8 @@ def apply_changes(pdf_bytes, info, edits, inserts, additions=(), objects=(), era
 
     place_pictures(doc, pictures, warnings)
     apply_additions(doc, info, additions, fc, warnings)
+    if delete:
+        _drop_pages(doc, info["_deleting"])
     fix_tounicode(doc, fc)
     warnings += stand_in_warnings(fc)
     if fc.get("shaped"):
@@ -3854,14 +3954,19 @@ def apply_changes(pdf_bytes, info, edits, inserts, additions=(), objects=(), era
             doc.subset_fonts()          # MuPDF's layout embeds its fonts whole (CJK alone is ~4 MB)
         except Exception:
             pass
+    order = [doc.page_xref(i) for i in range(doc.page_count)]   # the saved file keeps this page order
     out = doc.tobytes(garbage=4, deflate=True)
     pages = doc.page_count
     doc.close()
+    known, touched_x = set(orig_xrefs), {orig_xrefs[p] for p in touched}
+    check_pages = {i for i, x in enumerate(order) if x in touched_x or x not in known}
     check = fitz.open("pdf", out)
-    broken = set(missing_fonts(check, touched | set(range(pages_before, check.page_count)))) - broken_before
+    broken = {(order[p], f) for p, f in missing_fonts(check, check_pages)} - broken_before
     check.close()
     if broken:
-        raise BrokenOutput(f"edited text would use fonts missing from the page: {sorted(broken)}")
+        where = {x: i for i, x in enumerate(order)}
+        raise BrokenOutput(f"edited text would use fonts missing from the page: "
+                           f"{sorted((where[x], f) for x, f in broken)}")
     return out, pages, warnings
 
 
@@ -3965,14 +4070,38 @@ def analyze(pdf_bytes, max_pages=None, detail_pages=None, parts=None):
     for pno, (page, lines, band) in enumerate(zip(doc, all_lines, bands)):
         lists = parts[pno][3]
         pages.append({"lines": lines, "lists": lists, "images": all_images[pno], **band})
-        layout_pages.append(_public_page(pno, page, lines, lists, all_images[pno], copies))
+        layout_pages.append(_public_page(pno, page, lines, lists, all_images[pno], copies,
+                                         blank=page_is_blank(page, band, all_images[pno])))
     has_text = any(all_lines)
     signed = is_digitally_signed(doc)
     doc.close()
     return {"pages": pages}, {"schemaVersion": 1, "hasText": has_text, "signed": signed, "pages": layout_pages}
 
 
-def _public_page(pno, page, lines, lists, images=(), copies=None):
+def page_is_blank(page, band, images):
+    """True when nothing is on the page but a repeating header/footer or a page number: no other text,
+    no pictures, and nothing drawn (looked at as a small grey picture of the page, so lines, shapes,
+    form fields and stamps count; white boxes don't). Such a page can be offered for deleting."""
+    if images or band.get("body_lines"):
+        return False
+    clip = fitz.Rect(page.rect)
+    if not page.rotation:                    # header/footer boxes are in the page's own coordinates
+        if band.get("header_bottom"):
+            clip.y0 = band["header_bottom"] + 1
+        if band.get("footer_top"):
+            clip.y1 = band["footer_top"] - 1
+    elif page.get_text("text").strip():
+        return False
+    if clip.is_empty:
+        return True
+    try:
+        pix = page.get_pixmap(dpi=36, colorspace=fitz.csGRAY, clip=clip, alpha=False, annots=True)
+    except Exception:
+        return False
+    return not pix.samples or min(pix.samples) >= 245
+
+
+def _public_page(pno, page, lines, lists, images=(), copies=None, blank=False):
     """What the apps need to draw editing controls. Coordinates are PDF points,
     origin top-left of the page's visible area (multiply by zoom to get pixels)."""
     out_lines = []
@@ -4010,4 +4139,5 @@ def _public_page(pno, page, lines, lists, images=(), copies=None):
                    "group": f"g{im['xref']}" if im["xref"] and copies.get(im["xref"], 1) > 1 else None}
                   for k, im in enumerate(images)]
     return {"index": pno, "width": page.rect.width, "height": page.rect.height,
-            "rotated": bool(page.rotation), "lines": out_lines, "lists": out_lists, "images": out_images}
+            "rotated": bool(page.rotation), "blank": bool(blank),
+            "lines": out_lines, "lists": out_lists, "images": out_images}

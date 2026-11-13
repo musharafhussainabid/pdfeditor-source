@@ -80,7 +80,15 @@
   .viewer{padding:28px 16px 80px;overflow-x:auto}
   .page{position:relative;margin:0 auto 28px;background:#fff;box-shadow:var(--shadow);border-radius:2px}
   .page img{display:block;width:100%;user-select:none;-webkit-user-drag:none}
-  .page-label{text-align:center;color:var(--muted);font-size:12px;margin:-18px 0 22px}
+  .page-label{display:flex;align-items:center;justify-content:center;gap:10px;color:var(--muted);font-size:12px;margin:-18px 0 22px}
+  .page-label .chip{padding:1px 8px;border-radius:9px;background:var(--line);color:var(--ink);font-weight:600}
+  .page-label button{font:inherit;font-size:12px;padding:3px 10px;border-radius:12px;border:1px solid var(--line-strong);background:var(--surface);color:var(--ink);cursor:pointer}
+  .page-label button:hover{border-color:var(--danger);color:var(--danger)}
+  .page-label button.keep:hover{border-color:var(--line-strong);color:var(--ink)}
+  .page.deleted > *{opacity:.25;pointer-events:none}
+  .page.deleted::after{content:"This page will be deleted";position:absolute;inset:0;display:grid;place-items:center;
+    background:repeating-linear-gradient(135deg,rgba(253,236,236,.55),rgba(253,236,236,.55) 10px,rgba(255,255,255,.55) 10px,rgba(255,255,255,.55) 20px);
+    color:var(--danger);font-weight:700;font-size:15px;border:2px dashed var(--danger)}
   .no-preview{display:grid;place-items:center;color:var(--muted);font-size:14px}
   .ln{position:absolute;white-space:pre-wrap;color:transparent;caret-color:var(--ink);outline:none;cursor:text;border-radius:2px;
       transition:background .12s}
@@ -374,6 +382,7 @@ const edits = new Map();     // line id -> new text
 const lineStyles = new Map(); // line id -> its new style from the format bar (font, size, bold, italic, colour)
 let fmtLine = null;          // the line the format bar works on: stays while you use the bar
 const inserts = new Map();   // "listId|itemIndex" -> new points (one per line)
+const deleted = new Set();   // page indexes to delete when saving
 let added = [];              // new text boxes, images and signatures; rect is in PDF points
 let selectedId = null, addSeq = 0, lastSig = null;
 let newStyle = null;         // the style the next text box gets (picked up from the text you click)
@@ -462,12 +471,13 @@ async function openFile(f) {
       data.pages.forEach((p, i) => { p.preview = withImages.pages[i]?.preview; });
     }
     clearPreviews();
-    doc = data; pdfFile = f; edits.clear(); lineStyles.clear(); fmtLine = null; inserts.clear(); clearAdded(); selectedId = null;
+    doc = data; pdfFile = f; edits.clear(); lineStyles.clear(); fmtLine = null; inserts.clear(); deleted.clear(); clearAdded(); selectedId = null;
     bgCanvases.clear(); setupFonts(); setupImages();
     $("#docname").textContent = f.name;
     $("#docpages").textContent = `· ${data.pages.length} page${data.pages.length === 1 ? "" : "s"}`;
     $("#welcome").hidden = true; $("#fmt").hidden = false; $("#viewer").hidden = false; $("#actions").hidden = false; $("#docinfo").hidden = false;
     $("#notice").hidden = true; $("#hint").hidden = store.get("hintSeen") === "1";
+    offerBlankEnd();
     zoom = fitZoom(); render(); refresh(); window.scrollTo(0, 0);
     if (pdfjs) drawPages(pdfjs, f, data);           // in the background; pages appear as they're drawn
     if (data.signed) showNotice("This PDF is digitally signed:",
@@ -574,7 +584,7 @@ function render() {
   viewer.innerHTML = "";
   doc.pages.forEach(page => {
     const el = document.createElement("div");
-    el.className = "page" + (page.preview ? " has-preview" : "");
+    el.className = "page" + (page.preview ? " has-preview" : "") + (deleted.has(page.index) ? " deleted" : "");
     el.style.width = page.width * Z + "px";
     el.innerHTML = page.preview
       ? `<img alt="Page ${page.index + 1}" src="${page.preview}">`
@@ -620,14 +630,47 @@ function render() {
 
     added.filter(a => a.page === page.index).forEach(a => el.appendChild(addBox(a, Z)));
     viewer.appendChild(el);
-    const label = document.createElement("div");
-    label.className = "page-label"; label.textContent = `Page ${page.index + 1} of ${doc.pages.length}`;
-    viewer.appendChild(label);
+    viewer.appendChild(pageLabel(page));
   });
   viewer.querySelectorAll(".addn.text").forEach(b => b._sync());   // text height needs the page on screen
   updateFmt(); showObjBar();
 }
 const points = text => text.split("\n").filter(s => s.trim());
+
+// ---------- deleting pages ---------------------------------------------------------
+function pageLabel(page) {
+  const label = document.createElement("div"), gone = deleted.has(page.index);
+  label.className = "page-label";
+  label.append(`Page ${page.index + 1} of ${doc.pages.length}`);
+  if (page.blank) label.appendChild(Object.assign(document.createElement("span"), { className: "chip", textContent: "Empty page" }));
+  if (doc.pages.length > 1) {
+    const b = Object.assign(document.createElement("button"), { className: gone ? "keep" : "", textContent: gone ? "Keep page" : "Delete page" });
+    b.setAttribute("aria-label", `${gone ? "Keep" : "Delete"} page ${page.index + 1}`);
+    b.onclick = () => togglePage(page.index);
+    label.appendChild(b);
+  }
+  return label;
+}
+function togglePage(i, quiet) {
+  if (deleted.has(i)) deleted.delete(i);
+  else if (deleted.size >= doc.pages.length - 1) return toast("A PDF needs at least one page, so this page can't be deleted too.", { error: true });
+  else {
+    deleted.add(i);
+    if (!quiet) toast(`Page ${i + 1} will be deleted when you download.`, { action: "Undo", onAction: () => togglePage(i, true) });
+  }
+  if (selectedId) select(null);
+  render(); refresh();
+}
+// empty pages at the end of the document (a common leftover): offer to delete them in one go
+function offerBlankEnd() {
+  const end = [];
+  for (let i = doc.pages.length - 1; i > 0 && doc.pages[i].blank; i--) end.unshift(i);
+  if (!end.length || end.length >= doc.pages.length) return;
+  const what = end.length === 1 ? `The last page (page ${end[0] + 1}) is empty.` : `The last ${end.length} pages are empty.`;
+  toast(what, { action: end.length === 1 ? "Delete it" : "Delete them", ms: 9000, onAction: () => {
+    end.forEach(i => deleted.add(i)); render(); refresh();
+  }});
+}
 
 function lineBox(line, Z, pageWidth) {
   const [x0, y0, x1, y1] = line.bbox;
@@ -1371,7 +1414,7 @@ function placeSignature(sig) {
 
 // ---------- toolbar -----------------------------------------------------------
 const changedLines = () => [...new Set([...edits.keys(), ...lineStyles.keys()])];
-const pending = () => changedLines().length + inserts.size + added.length + objs.size + erases.length;
+const pending = () => changedLines().length + inserts.size + added.length + objs.size + erases.length + deleted.size;
 function refresh() {
   const n = pending();
   $("#save").disabled = !n; $("#discard").disabled = !n;
@@ -1387,9 +1430,10 @@ $("#zoomIn").onclick = () => setZoom(ZOOMS.find(z => z > zoom + 0.01) || 2);
 $("#zoomOut").onclick = () => setZoom([...ZOOMS].reverse().find(z => z < zoom - 0.01) || 0.5);
 
 $("#discard").onclick = () => {
-  const saved = [new Map(edits), new Map(inserts), added, new Map(objs), erases, new Map(lineStyles)];
-  edits.clear(); lineStyles.clear(); inserts.clear(); added = []; objs.clear(); erases = []; selectedId = null; render(); refresh();
+  const saved = [new Map(edits), new Map(inserts), added, new Map(objs), erases, new Map(lineStyles), new Set(deleted)];
+  edits.clear(); lineStyles.clear(); inserts.clear(); deleted.clear(); added = []; objs.clear(); erases = []; selectedId = null; render(); refresh();
   toast("All changes discarded.", { action: "Undo", onAction: () => {
+    saved[6].forEach(i => deleted.add(i));
     saved[0].forEach((v, k) => edits.set(k, v)); saved[1].forEach((v, k) => inserts.set(k, v)); added = saved[2];
     saved[3].forEach((v, k) => objs.set(k, v)); erases = saved[4]; saved[5].forEach((v, k) => lineStyles.set(k, v)); render(); refresh();
   }});
@@ -1438,6 +1482,7 @@ $("#save").addEventListener("click", async () => {
       : o.allPages ? { id: o.id, action: "replace", imageId: "rep-" + o.id, allPages: true }
       : { id: o.id, action: "replace", imageId: "rep-" + o.id, page: o.page, rect: o.rect.map(r2) }),
     erase: erases.map(er => ({ page: er.page, rect: er.rect.map(r2), text: er.text })),
+    deletePages: [...deleted].sort((a, b) => a - b),
   };
   busy("Applying your changes…");
   try {

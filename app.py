@@ -511,7 +511,8 @@ async def edit(request: Request, file: UploadFile = File(...), changes: str = Fo
     changes = {"edits": [{"lineId", "text", "style"?}], "inserts": [{"listId", "afterItem", "items"}],
                "additions": [{"type": "text"|"image"|"signature", "page", "rect", ...}],
                "objects": [{"id": "p0-i2", "action": "remove"|"move"|"replace", "allPages", "page", "rect", "imageId"}],
-               "erase": [{"page", "rect", "text": false}]}
+               "erase": [{"page", "rect", "text": false}],
+               "deletePages": [page numbers from 0, as /analyze numbered them]}
     A text addition with "font": "doc" and "fontFrom": "<lineId>" is written in that line's own font.
     An edit's optional "style" restyles the whole line: {"font", "fontFrom", "size", "bold", "italic", "color"},
     each optional (missing = the line's own).
@@ -521,7 +522,10 @@ async def edit(request: Request, file: UploadFile = File(...), changes: str = Fo
     data = await read_pdf(file)
     files = await read_images(images)
     deadline = asyncio.get_running_loop().time() + JOB_TIMEOUT
-    parts, long = await read_parts(data, deadline, changed_pages(changes))
+    if only_deleting(changes):
+        parts, long = None, False          # no text is read: quick even for long PDFs
+    else:
+        parts, long = await read_parts(data, deadline, changed_pages(changes))
     out, warnings, counts = await engine(edit_job, data, changes, files, parts, deadline=deadline, long=long)
     request.state.log = {**counts, "warnings": len(warnings), "bytesOut": len(out)}
     name = (file.filename or "document.pdf").rsplit(".", 1)[0]
@@ -547,6 +551,32 @@ def _detail_pages(body):
     return detail
 
 
+CHANGE_KEYS = ("edits", "inserts", "additions", "objects", "erase")
+
+
+def only_deleting(changes):
+    """True when the request only deletes pages (then the PDF's text needn't be read at all)."""
+    try:
+        body = json.loads(changes)
+        return isinstance(body, dict) and bool(body.get("deletePages")) and not any(body.get(k) for k in CHANGE_KEYS)
+    except (ValueError, TypeError):
+        return False
+
+
+def read_delete_pages(value, page_count):
+    if value in (None, []):
+        return []
+    if not isinstance(value, list) or not all(isinstance(p, int) and not isinstance(p, bool) for p in value):
+        raise HTTPException(400, "'deletePages' must be a list of page numbers (counting from 0).")
+    bad = [p for p in value if not 0 <= p < page_count]
+    if bad:
+        raise HTTPException(400, f"Unknown page in deletePages: {bad[0]} (the PDF has {page_count} pages, numbered from 0).")
+    pages = sorted(set(value))
+    if len(pages) >= page_count:
+        raise HTTPException(400, "A PDF needs at least one page, so not every page can be deleted.")
+    return pages
+
+
 def changed_pages(changes):
     """_detail_pages for the raw 'changes' text; an empty set when it isn't valid (edit_job refuses it)."""
     try:
@@ -563,6 +593,12 @@ def _edit(data, changes, files, parts=None):
         raise HTTPException(400, "'changes' must be JSON.")
     if not isinstance(body, dict):
         raise HTTPException(400, "'changes' must be a JSON object.")
+    if body.get("deletePages") and not any(body.get(k) for k in CHANGE_KEYS):
+        n = page_count_job(data)
+        delete = read_delete_pages(body["deletePages"], n)
+        out, pages = edit_doc.delete_pages(data, delete)
+        return out, [], {"pages": pages, "edits": 0, "inserts": 0, "additions": 0, "objects": 0, "erase": 0,
+                         "deleted": len(delete)}
     # Same PDF -> same analysis -> the ids from /analyze match. Only the pages whose text or lists
     # change need the slow part of the analysis (columns, lists): much faster for long or dense PDFs.
     info, _layout = analysis(data, _detail_pages(body), parts)
@@ -588,11 +624,13 @@ def _edit(data, changes, files, parts=None):
         inserts.append({"page": int(m[1]), "list": int(m[2]), "after": k, "items": items})
     additions = read_additions(body.get("additions") or [], files, pages)
     objects, erase = read_objects(body.get("objects") or [], body.get("erase") or [], files, pages)
+    delete = read_delete_pages(body.get("deletePages"), len(pages))
     if not edits and not inserts and not additions and not objects and not erase:
         raise HTTPException(400, "No changes given.")
-    out, page_count, warnings = edit_doc.apply_changes(data, info, edits, inserts, additions, objects, erase)
+    out, page_count, warnings = edit_doc.apply_changes(data, info, edits, inserts, additions, objects, erase, delete)
     return out, warnings, {"pages": page_count, "edits": len(edits), "inserts": len(inserts),
-                           "additions": len(additions), "objects": len(objects), "erase": len(erase)}
+                           "additions": len(additions), "objects": len(objects), "erase": len(erase),
+                           "deleted": len(delete)}
 
 
 @app.api_route("/healthz", methods=["GET", "HEAD"], include_in_schema=False)  # uptime monitors often use HEAD
